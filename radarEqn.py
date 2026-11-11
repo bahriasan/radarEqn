@@ -1,0 +1,2889 @@
+"""
+Radar Detection Range Calculator
+(radar equation + MOP + coherent integration + loss budget
+ + antenna pattern / pointing + target RCS / geometry + polarisation)
+
+Model
+-----
+Pulse energy                : E = Pt * tau
+Signal bandwidth (B_sig)    : None -> 1/tau,  LFM -> chirp BW,  Phase code -> Nc/tau
+Pulse compression ratio     : D = B_sig * tau
+Receiver BW mismatch factor : eta = min(B_rx/B_sig, B_sig/B_rx)   (simplified)
+
+Single-pulse SNR at range R (monostatic, same antenna for TX and RX):
+    SNR1(R) = E * eta * G(theta)^2 lambda^2 sigma(aspect, pol)
+              / ((4 pi)^3 k T F L_sys R^4) / L_path(R)
+
+    G(theta)  : antenna gain toward the target, from the pattern table
+                and the angle between antenna pointing and target direction
+    sigma     : target RCS from the RCS table (frequency, aspect, polarisation)
+    L_sys     : sum (in dB) of fixed losses (lines, radome, ...)
+    L_path(R) : two-way atmospheric + rain loss
+                = 2 * alpha_atm * R  +  2 * gamma_rain(pol, elev) * min(R, rain path)
+
+Coherent integration of N pulses (N = floor(CPI / PRI)):
+    SNR_N = SNR1 * N / (L_integration * L_doppler_window)
+
+Detection range: solve SNR(R) = SNR_required for R (bisection).
+
+Coordinates
+-----------
+Azimuth: degrees clockwise from north. Elevation: degrees above horizon.
+Target heading: direction the target nose points / moves, clockwise from north.
+Aspect angle: 0 = nose-on (target flying toward the radar), 180 = tail-on.
+
+Tables (folder "loss_tables" next to this script, works offline)
+----------------------------------------------------------------
+atmos.csv         freq_ghz, db_per_km              clear-air, one-way
+rain_coeffs.csv   freq_ghz, kH, alphaH, kV, alphaV ITU-R P.838-3
+antenna_gain.csv  freq_ghz, angle_deg, az_cut_dbi, el_cut_dbi     (DUMMY)
+rcs.csv           freq_ghz, aspect_deg, H, V, C (m^2)             (DUMMY)
+radome.csv        freq_ghz, H, V, C (dB)                          (DUMMY)
+Any loss key can get its own table <key>.csv with columns
+    freq_ghz,value         (polarisation independent)  or
+    freq_ghz,H,V,C         (per polarisation)
+Tables whose comment lines contain the word DUMMY are flagged in the results.
+
+Matched filter view (optional, needs numpy + matplotlib)
+--------------------------------------------------------
+Target speed, Doppler found, unambiguous range / Doppler
+--------------------------------------------------------
+The target flies level along its heading at the given speed. The closing
+speed v*cos(elevation)*cos(aspect) gives the Doppler 2*v_r/lambda (+ =
+approaching); the tangential part gives the LOS angular rate only. The
+TARGET section shows what the radar finds: PRI Stable gives the apparent
+(folded) range and Doppler; PRI Switcher resolves both from the different
+PRIs / PRFs. Unambiguous range is c*PRI/2 (c*LCM/2 when switching) and the
+unambiguous Doppler is +-PRF/2 (+-1/(2*GCD(PRI)) when switching).
+
+CPI by time or by pulse count, Doppler
+--------------------------------------
+"CPI defined by" selects which one you enter: the CPI time (N = floor(CPI /
+PRI) pulses) or the pulse count N (CPI = N x PRI); the other one is computed
+and shown. PRF = 1 / PRI is shown as well. Doppler resolution is 1 / (N x
+PRI), accuracy is the Cramer-Rao bound at the post-integration SNR, and the
+FFT length is the next power of two >= N.
+
+PRI Stable / PRI Switcher
+-------------------------
+PRI Stable: one PRI. PRI Switcher: a list of PRIs (us, comma separated), each
+held for one CPI (the CPI input is the dwell time per PRI). Coherent
+integration only happens inside a dwell, where RF and PRI are constant:
+N = floor(CPI / PRI) pulses per dwell, so longer PRIs integrate fewer pulses.
+Dwells are not combined; they resolve the range ambiguity: the apparent
+(folded) range R mod c*PRI/2 is measured in each PRI and matched (tolerance =
+range resolution), which extends the unambiguous range to c*LCM(PRIs)/2.
+An echo is also lost (eclipsed) in a PRI if it overlaps a transmit pulse.
+Detection is judged per dwell; the limiting dwell (lowest net integration
+gain) is reported as the headline detection range.
+
+2D geometry view (optional, needs numpy + matplotlib)
+-----------------------------------------------------
+Plan view (top-down, north up), side view (vertical plane through the target),
+antenna gain cuts and target RCS vs aspect. Everything is drawn from the
+current inputs and tables and updates live:
+  - antenna lobe = gain from the antenna_gain table for the current pointing
+    (plan view: azimuth sweep at the target elevation; side view: elevation
+    sweep at the target azimuth), so the lobe passes through the gain that
+    the radar equation actually uses toward the target
+  - target RCS lobe = RCS table vs aspect, oriented with the target heading
+Lobes are shown on a dB scale (antenna 40 dB, RCS 30 dB span) and are not to
+scale in range. With manual gain / RCS there is no pattern, so none is drawn.
+
+Matched filter view (optional, needs numpy + matplotlib)
+--------------------------------------------------------
+Uses only the defined waveform: PW, MOP (None / LFM chirp bandwidth /
+phase code chips) and receiver bandwidth B_rx. The received pulse plus
+complex white Gaussian noise passes the B_rx front end and a matched filter
+whose replica is the transmitted pulse band-limited to the same B_rx.
+The signal amplitude is calibrated so that the matched filter output peak
+SNR equals the single-pulse (or integrated) SNR at the target range from the
+radar equation.
+"""
+
+import csv
+import math
+import textwrap
+import tkinter as tk
+from pathlib import Path
+from tkinter import ttk, messagebox
+
+try:
+    import numpy as np
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import (
+        FigureCanvasTkAgg, NavigationToolbar2Tk)
+    HAVE_PLOT = True
+except ImportError:          # the calculator works without the plot
+    HAVE_PLOT = False
+
+# Constants
+C = 299_792_458.0
+K = 1.380649e-23
+FOUR_PI_CUBED = (4 * math.pi) ** 3
+
+MOP_OPTIONS = ("None", "LFM", "Phase code")
+MOP_PARAM_LABEL = {
+    "LFM": "Chirp bandwidth (MHz)",
+    "Phase code": "Number of chips",
+}
+MOP_PARAM_DEFAULT = {"LFM": "10", "Phase code": "13"}
+
+PRI_MODES = ("PRI Stable", "PRI Switcher")
+CPI_MODES = ("CPI time", "Pulse count")
+PRI_LIST_DEFAULT = "100, 110, 121"          # us, used when PRI Switcher is chosen
+STATUS_COLOR = {"ok": "#1a7f37", "warn": "#b9770e", "bad": "#c0392b"}
+
+POL_OPTIONS = ("H", "V", "Circular")
+POL_CODE = {"H": "H", "V": "V", "Circular": "C"}
+POL_TILT_DEG = {"H": 0.0, "V": 90.0, "C": 45.0}   # ITU-R P.838 tau
+
+# key, label, default (dB), typical value text, scope
+#   scope: "all"   -> applies to single pulse and coherent range
+#          "mop"   -> applies only when pulse compression (MOP) is used
+#          "integ" -> applies only to coherent integration (N > 1)
+LOSS_FIELDS = [
+    ("tx_line",    "TX line loss (dB)",           "1.0", "0.5-2",        "all"),
+    ("rx_line",    "RX line loss (dB)",           "1.0", "0.5-2",        "all"),
+    ("radome",     "Radome loss, 2-way (dB)",     "1.0", "0.5-1.5",      "all"),
+    ("beam_shape", "Beam shape loss (dB)",        "0",   "0 if pointing modeled, 1.6 scan", "all"),
+    ("mf",         "Matched filter loss (dB)",    "0.8", "0.5-1",        "all"),
+    ("pc_window",  "PC window loss (dB)",         "1.3", "Hamming 1.3, Taylor 1.1", "mop"),
+    ("straddle",   "Straddle loss (dB)",          "1.0", "1-3 (range+Doppler)", "all"),
+    ("cfar",       "CFAR loss (dB)",              "1.0", "0.5-2",        "all"),
+    ("other",      "Other losses (dB)",           "0",   "-",            "all"),
+    ("integration", "Integration loss (dB)",      "0.5", "0-1 (coherent)", "integ"),
+    ("doppler_window", "Doppler window loss (dB)", "1.3", "Hamming 1.3", "integ"),
+]
+ATMOS_FIELD = ("atmos", "Atmospheric atten., 1-way (dB/km)", "0.013",
+               "X-band clear 0.01-0.02")
+RAIN_FIELDS = [
+    ("rain_rate", "Rain rate (mm/h)", "0", "4 moderate, 16 heavy"),
+    ("rain_path", "Rain path length (km, 0 = full)", "0", "-"),
+]
+
+# Entry key -> table name (when different)
+TABLE_NAME = {"gain": "antenna_gain", "rcs": "rcs"}
+
+# Table structure by name; anything else is a "freq" table
+TABLE_KIND = {
+    "rain_coeffs": "rain",
+    "antenna_gain": "grid",
+    "rcs": "grid",
+}
+GRID_COLUMNS = {"antenna_gain": 4, "rcs": 5}
+
+
+# -----------------------------------------------------------------
+# Default tables (written to loss_tables/ on first run)
+# -----------------------------------------------------------------
+
+def _pattern_rel_db(theta, beamwidth):
+    """Dummy pattern cut: Gaussian main beam + sloping sidelobe floor."""
+    main = -12.0 * (theta / beamwidth) ** 2
+    floor = -25.0 - 15.0 * min(theta, 90.0) / 90.0
+    return max(main, floor)
+
+
+def _dummy_gain_rows():
+    angles = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 10, 12, 15,
+              20, 25, 30, 40, 50, 60, 75, 90, 120, 150, 180]
+    rows = []
+    for f in (2, 5, 8, 10, 12, 15, 18):
+        g0 = 30.0 + 20.0 * math.log10(f / 10.0)     # fixed aperture
+        bw_az = 4.0 * 10.0 / f                      # 3 dB beamwidths
+        bw_el = 10.0 * 10.0 / f
+        for a in angles:
+            rows.append((f, a,
+                         round(g0 + _pattern_rel_db(a, bw_az), 2),
+                         round(g0 + _pattern_rel_db(a, bw_el), 2)))
+    return rows
+
+
+def _dummy_rcs_rows():
+    aspects = [0, 15, 30, 45, 60, 75, 85, 90, 95, 105, 120, 135, 150, 165, 180]
+    base_h = [1.0, 1.2, 1.8, 2.5, 3.5, 6.0, 15.0, 40.0, 15.0, 6.0,
+              4.0, 3.0, 3.5, 4.5, 6.0]
+    rows = []
+    for f, scale in ((1, 0.7), (3, 0.85), (10, 1.0), (35, 1.2)):
+        for a, h in zip(aspects, base_h):
+            h = h * scale
+            rows.append((f, a, round(h, 4), round(0.85 * h, 4),
+                         round(0.6 * h, 4)))
+    return rows
+
+
+DEFAULT_TABLES = {
+    "atmos": {
+        "comment": [
+            "Clear-air atmospheric attenuation, ONE-WAY, dB/km",
+            "Sea level, standard atmosphere (7.5 g/m^3 water vapour)",
+            "Approximate values read from ITU-R P.676 curves (+/-20%).",
+            "Gaseous attenuation does not depend on polarisation.",
+        ],
+        "header": ["freq_ghz", "db_per_km"],
+        "rows": [
+            (1, 0.0054), (2, 0.0064), (3, 0.0071), (4, 0.0077),
+            (5, 0.0084), (6, 0.0091), (8, 0.0108), (10, 0.0132),
+            (12, 0.0170), (14, 0.0230), (16, 0.0330), (18, 0.0560),
+            (20, 0.100), (22.2, 0.180), (24, 0.160), (26, 0.130),
+            (30, 0.110), (35, 0.120), (40, 0.150), (45, 0.250),
+            (50, 0.500), (55, 3.0), (60, 15.0), (65, 2.0),
+            (70, 0.50), (80, 0.30), (94, 0.40), (100, 0.45),
+        ],
+    },
+    "rain_coeffs": {
+        "comment": [
+            "Rain specific attenuation coefficients, ITU-R P.838-3",
+            "gamma [dB/km] = k * R^alpha, R = rain rate (mm/h)",
+            "Values transcribed approximately; verify for critical use.",
+            "Polarisation / elevation combination per P.838 (tau, theta).",
+        ],
+        "header": ["freq_ghz", "kH", "alphaH", "kV", "alphaV"],
+        "rows": [
+            (1, 0.0000259, 0.9691, 0.0000308, 0.8592),
+            (2, 0.0000847, 1.0664, 0.0000998, 0.9490),
+            (4, 0.0001071, 1.6009, 0.0002461, 1.2476),
+            (6, 0.0007056, 1.5900, 0.0004878, 1.5728),
+            (8, 0.004115, 1.3905, 0.003450, 1.3797),
+            (10, 0.01217, 1.2571, 0.01129, 1.2156),
+            (12, 0.02386, 1.1825, 0.02455, 1.1216),
+            (15, 0.04481, 1.1233, 0.05008, 1.0440),
+            (20, 0.09164, 1.0568, 0.09611, 0.9847),
+            (25, 0.1571, 0.9991, 0.1533, 0.9491),
+            (30, 0.2403, 0.9485, 0.2291, 0.9129),
+            (35, 0.3374, 0.9047, 0.3224, 0.8761),
+            (40, 0.4431, 0.8673, 0.4274, 0.8421),
+            (50, 0.6600, 0.8084, 0.6472, 0.7871),
+            (60, 0.8606, 0.7656, 0.8515, 0.7486),
+            (80, 1.1704, 0.7115, 1.1668, 0.7021),
+            (100, 1.3671, 0.6815, 1.3680, 0.6721),
+        ],
+    },
+    "antenna_gain": {
+        "comment": [
+            "DUMMY antenna pattern - replace with measured data.",
+            "Principal-plane cuts vs off-boresight angle (0-180 deg).",
+            "Gain toward a direction = az_cut(az_off) + el_cut(el_off) - peak",
+            "Dummy: fixed aperture, 30 dBi / 4 x 10 deg beam at 10 GHz.",
+        ],
+        "header": ["freq_ghz", "angle_deg", "az_cut_dbi", "el_cut_dbi"],
+        "rows": _dummy_gain_rows(),
+    },
+    "rcs": {
+        "comment": [
+            "DUMMY target RCS (m^2) - replace with real target data.",
+            "aspect_deg: 0 = nose-on, 90 = broadside, 180 = tail-on.",
+            "Columns per polarisation: H, V, C (circular).",
+        ],
+        "header": ["freq_ghz", "aspect_deg", "H", "V", "C"],
+        "rows": _dummy_rcs_rows(),
+    },
+    "radome": {
+        "comment": [
+            "DUMMY radome loss, TWO-WAY, dB - replace with radome data.",
+            "Columns per polarisation: H, V, C (circular).",
+        ],
+        "header": ["freq_ghz", "H", "V", "C"],
+        "rows": [
+            (1, 0.5, 0.7, 0.6), (5, 0.7, 0.9, 0.8), (10, 1.0, 1.2, 1.1),
+            (18, 1.3, 1.6, 1.45), (35, 2.0, 2.4, 2.2),
+        ],
+    },
+}
+
+
+def default_table_dir():
+    try:
+        return Path(__file__).resolve().parent / "loss_tables"
+    except NameError:
+        return Path.cwd() / "loss_tables"
+
+
+# =================================================================
+# TABLES (pure, no GUI)
+# =================================================================
+
+def write_table(path, header, rows, comment=()):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        for line in comment:
+            f.write(f"# {line}\n")
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def read_table(path):
+    """Read a CSV table. Returns (header, rows, comment_lines)."""
+    header, rows, comments = None, [], []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for raw in csv.reader(f):
+            if not raw or not raw[0].strip():
+                continue
+            if raw[0].strip().startswith("#"):
+                comments.append(",".join(raw))
+                continue
+            cells = [c.strip() for c in raw]
+            if header is None:
+                header = cells
+                continue
+            try:
+                row = tuple(float(c.replace(",", ".")) for c in cells)
+            except ValueError:
+                raise ValueError(f"non-numeric row {cells}") from None
+            if len(row) != len(header):
+                raise ValueError(f"row {cells} does not match header")
+            rows.append(row)
+    if header is None or len(rows) < 2:
+        raise ValueError("needs a header and at least 2 data rows")
+    return header, rows, comments
+
+
+def prepare_table(name, header, rows):
+    """Validate and convert raw rows into a lookup structure."""
+    kind = TABLE_KIND.get(name, "freq")
+    if any(r[0] <= 0 for r in rows):
+        raise ValueError("frequencies must be positive")
+
+    if kind == "freq":
+        rows = sorted(rows, key=lambda r: r[0])
+        xs = [r[0] for r in rows]
+        if any(b <= a for a, b in zip(xs, xs[1:])):
+            raise ValueError("duplicate frequency values")
+        names = [h.strip().upper() for h in header[1:]]
+        if len(names) == 1:
+            cols = {"value": [r[1] for r in rows]}
+        elif sorted(names) == ["C", "H", "V"]:
+            cols = {n: [r[i + 1] for r in rows] for i, n in enumerate(names)}
+        else:
+            raise ValueError("use columns freq_ghz,value or freq_ghz,H,V,C")
+        return {"kind": "freq", "xs": xs, "cols": cols}
+
+    if kind == "rain":
+        expected = ["freq_ghz", "kh", "alphah", "kv", "alphav"]
+        if [h.strip().lower() for h in header] != expected:
+            raise ValueError("expected columns freq_ghz,kH,alphaH,kV,alphaV")
+        rows = sorted(rows, key=lambda r: r[0])
+        xs = [r[0] for r in rows]
+        if any(b <= a for a, b in zip(xs, xs[1:])):
+            raise ValueError("duplicate frequency values")
+        if any(v <= 0 for r in rows for v in (r[1], r[3])):
+            raise ValueError("k values must be positive")
+        return {"kind": "rain", "xs": xs,
+                "kH": [r[1] for r in rows], "aH": [r[2] for r in rows],
+                "kV": [r[3] for r in rows], "aV": [r[4] for r in rows]}
+
+    # grid: freq_ghz, angle, value columns...
+    if len(header) != GRID_COLUMNS[name]:
+        raise ValueError(f"expected {GRID_COLUMNS[name]} columns")
+    groups = {}
+    for r in rows:
+        groups.setdefault(r[0], []).append(r)
+    data = {}
+    for f, grp in groups.items():
+        grp.sort(key=lambda r: r[1])
+        angles = [r[1] for r in grp]
+        if len(angles) < 2 or any(b <= a for a, b in zip(angles, angles[1:])):
+            raise ValueError(f"{f:g} GHz needs >= 2 distinct angles")
+        if angles[0] < 0:
+            raise ValueError("angles must be >= 0 (pattern is symmetric)")
+        cols = [[r[i] for r in grp] for i in range(2, len(header))]
+        data[f] = (angles, cols)
+    col_names = [h.strip().upper() for h in header[2:]]
+    return {"kind": "grid", "fs": sorted(data), "data": data,
+            "col_names": col_names}
+
+
+def load_tables(table_dir=None):
+    """
+    Returns (tables, messages).
+    tables: {name: lookup structure + "source" + "dummy"}.
+    Built-in defaults are always available; CSV files override them.
+    """
+    table_dir = Path(table_dir) if table_dir else default_table_dir()
+    messages = []
+    tables = {}
+    for name, d in DEFAULT_TABLES.items():
+        t = prepare_table(name, d["header"], d["rows"])
+        t["source"] = "built-in"
+        t["dummy"] = any("DUMMY" in c for c in d["comment"])
+        tables[name] = t
+
+    try:
+        table_dir.mkdir(parents=True, exist_ok=True)
+        for name, d in DEFAULT_TABLES.items():
+            path = table_dir / f"{name}.csv"
+            if path.exists() and name == "rain_coeffs":
+                # Upgrade the old H-only file written by the previous version
+                try:
+                    header, _rows, _c = read_table(path)
+                    if len(header) == 3:
+                        path.replace(path.with_suffix(".csv.old"))
+                        messages.append(
+                            "rain_coeffs.csv upgraded to H/V format "
+                            "(old file kept as rain_coeffs.csv.old).")
+                except (OSError, ValueError):
+                    pass
+            if not path.exists():
+                write_table(path, d["header"], d["rows"], d["comment"])
+    except OSError as exc:
+        messages.append(
+            f"Could not create default tables ({exc}); using built-in values."
+        )
+
+    if table_dir.is_dir():
+        for path in sorted(table_dir.glob("*.csv")):
+            try:
+                header, rows, comments = read_table(path)
+                t = prepare_table(path.stem, header, rows)
+            except (OSError, ValueError, KeyError) as exc:
+                messages.append(f"{path.name} ignored: {exc}")
+                continue
+            t["source"] = path.name
+            t["dummy"] = any("DUMMY" in c for c in comments)
+            tables[path.stem] = t
+    return tables, messages
+
+
+def interp(xs, ys, x, log_x=False, log_y=False):
+    """Piecewise-linear interpolation. Returns (value, clamped)."""
+    clamped = x < xs[0] or x > xs[-1]
+    x = min(max(x, xs[0]), xs[-1])
+    i = 0
+    while i < len(xs) - 2 and x > xs[i + 1]:
+        i += 1
+    x0, x1, y0, y1 = xs[i], xs[i + 1], ys[i], ys[i + 1]
+    if log_x:
+        x0, x1, x = math.log10(x0), math.log10(x1), math.log10(x)
+    if log_y:
+        y0, y1 = math.log10(y0), math.log10(y1)
+    t = (x - x0) / (x1 - x0)
+    y = y0 + t * (y1 - y0)
+    return (10 ** y if log_y else y), clamped
+
+
+def _range_note(tbl, what, value, lo, hi, unit):
+    return (f"{tbl['source']}: {what} {value:g} {unit} is outside the table "
+            f"({lo:g}-{hi:g} {unit}); end value used.")
+
+
+def table_value(tables, name, freq_ghz, pol="H"):
+    """Interpolated value of a frequency table. Returns (value, note)."""
+    tbl = tables[name]
+    cols = tbl["cols"]
+    ys = cols["value"] if "value" in cols else cols[pol]
+    log_y = name == "atmos" and all(y > 0 for y in ys)
+    value, clamped = interp(tbl["xs"], ys, freq_ghz, log_y=log_y)
+    note = None
+    if clamped:
+        note = _range_note(tbl, "frequency", freq_ghz,
+                           tbl["xs"][0], tbl["xs"][-1], "GHz")
+    return value, note
+
+
+def grid_value(tbl, freq_ghz, angle_deg, col, log=False):
+    """Bilinear lookup in a grid table. Returns (value, notes)."""
+    notes = []
+    fs = tbl["fs"]
+
+    def along(f):
+        angles, cols = tbl["data"][f]
+        ys = cols[col]
+        if log:
+            ys = [10 * math.log10(y) for y in ys]
+        v, cl = interp(angles, ys, angle_deg)
+        if cl:
+            notes.append(_range_note(tbl, "angle", angle_deg,
+                                     angles[0], angles[-1], "deg"))
+        return v
+
+    if len(fs) == 1:
+        v = along(fs[0])
+    else:
+        if freq_ghz < fs[0] or freq_ghz > fs[-1]:
+            notes.append(_range_note(tbl, "frequency", freq_ghz,
+                                     fs[0], fs[-1], "GHz"))
+        f = min(max(freq_ghz, fs[0]), fs[-1])
+        i = 0
+        while i < len(fs) - 2 and f > fs[i + 1]:
+            i += 1
+        v0, v1 = along(fs[i]), along(fs[i + 1])
+        t = (f - fs[i]) / (fs[i + 1] - fs[i])
+        v = v0 + t * (v1 - v0)
+    if log:
+        v = 10 ** (v / 10)
+    return v, notes
+
+
+def antenna_gain(tables, freq_ghz, off_az_deg, off_el_deg):
+    """
+    Gain toward a direction from principal-plane cuts:
+        G = az_cut(|az_off|) + el_cut(|el_off|) - G_peak     (dB)
+    Returns (gain_dbi, peak_dbi, notes).
+    """
+    tbl = tables["antenna_gain"]
+    notes = []
+    g_az, n1 = grid_value(tbl, freq_ghz, abs(off_az_deg), 0)
+    g_el, n2 = grid_value(tbl, freq_ghz, abs(off_el_deg), 1)
+    p_az, _ = grid_value(tbl, freq_ghz, 0.0, 0)
+    p_el, _ = grid_value(tbl, freq_ghz, 0.0, 1)
+    peak = max(p_az, p_el)
+    gain = max(g_az + g_el - peak, peak - 60.0)
+    for n in n1 + n2:
+        if n not in notes:
+            notes.append(n)
+    return gain, peak, notes
+
+
+def rcs_value(tables, freq_ghz, aspect_deg, pol):
+    tbl = tables["rcs"]
+    if pol not in tbl["col_names"]:
+        raise ValueError(f"rcs table has no column for polarisation {pol}")
+    return grid_value(tbl, freq_ghz, aspect_deg,
+                      tbl["col_names"].index(pol), log=True)
+
+
+def rain_attenuation(tables, freq_ghz, rate_mm_h, pol="H", elev_deg=0.0):
+    """
+    One-way rain specific attenuation (dB/km), ITU-R P.838-3:
+        k     = [kH + kV + (kH - kV) cos^2(theta) cos(2 tau)] / 2
+        alpha = [kH aH + kV aV + (kH aH - kV aV) cos^2(theta) cos(2 tau)] / (2k)
+    Returns (gamma, note).
+    """
+    if rate_mm_h <= 0:
+        return 0.0, None
+    tbl = tables["rain_coeffs"]
+    xs = tbl["xs"]
+    kh, clamped = interp(xs, tbl["kH"], freq_ghz, log_x=True, log_y=True)
+    kv, _ = interp(xs, tbl["kV"], freq_ghz, log_x=True, log_y=True)
+    ah, _ = interp(xs, tbl["aH"], freq_ghz, log_x=True)
+    av, _ = interp(xs, tbl["aV"], freq_ghz, log_x=True)
+    c = math.cos(math.radians(elev_deg)) ** 2 * \
+        math.cos(math.radians(2 * POL_TILT_DEG[pol]))
+    k = (kh + kv + (kh - kv) * c) / 2
+    alpha = (kh * ah + kv * av + (kh * ah - kv * av) * c) / (2 * k)
+    note = None
+    if clamped:
+        note = _range_note(tbl, "frequency", freq_ghz, xs[0], xs[-1], "GHz")
+    return k * rate_mm_h ** alpha, note
+
+
+# =================================================================
+# GEOMETRY (pure)
+# =================================================================
+
+def wrap180(angle):
+    return (angle + 180.0) % 360.0 - 180.0
+
+
+def off_boresight(tgt_az, tgt_el, ant_az, ant_el):
+    """
+    Target direction in antenna coordinates.
+    Returns (az_off, el_off, total_off) in degrees.
+    """
+    a, e = math.radians(tgt_az), math.radians(tgt_el)
+    v = (math.cos(e) * math.cos(a), math.cos(e) * math.sin(a), math.sin(e))
+    pa, pe = math.radians(ant_az), math.radians(ant_el)
+    # rotate by -antenna azimuth about z
+    x1 = v[0] * math.cos(pa) + v[1] * math.sin(pa)
+    y1 = -v[0] * math.sin(pa) + v[1] * math.cos(pa)
+    z1 = v[2]
+    # rotate by antenna elevation about y
+    x2 = x1 * math.cos(pe) + z1 * math.sin(pe)
+    z2 = -x1 * math.sin(pe) + z1 * math.cos(pe)
+    y2 = y1
+    az_off = math.degrees(math.atan2(y2, x2))
+    el_off = math.degrees(math.atan2(z2, math.hypot(x2, y2)))
+    total = math.degrees(math.acos(max(-1.0, min(1.0, x2))))
+    return az_off, el_off, total
+
+
+def aspect_angle(tgt_heading, tgt_az):
+    """0 = nose-on (flying toward radar), 180 = tail-on. Horizontal plane."""
+    los_to_radar = tgt_az + 180.0
+    return abs(wrap180(tgt_heading - los_to_radar))
+
+
+# =================================================================
+# RADAR CALCULATIONS (pure)
+# =================================================================
+
+def db_to_lin(db):
+    return 10 ** (db / 10)
+
+
+def lin_to_db(x):
+    return 10 * math.log10(x)
+
+
+def pulse_count(pri_us, cpi_ms):
+    """Number of complete PRIs inside the CPI."""
+    # Small tolerance so e.g. 10 ms / 100 us gives 100, not 99 (float error)
+    n = math.floor(cpi_ms * 1000.0 / pri_us + 1e-9)
+    if n < 1:
+        raise ValueError("CPI must contain at least one PRI.")
+    return n
+
+
+def signal_bandwidth_hz(pw_us, mop, mop_param):
+    """
+    Bandwidth of the transmitted pulse.
+    Returns (bandwidth_hz, note) where note is a warning string or None.
+    """
+    if pw_us <= 0:
+        raise ValueError("Pulse width must be positive.")
+    pw_s = pw_us * 1e-6
+    natural = 1.0 / pw_s
+
+    if mop == "None":
+        return natural, None
+
+    if mop == "LFM":
+        if mop_param is None or mop_param <= 0:
+            raise ValueError("Chirp bandwidth must be positive.")
+        chirp = mop_param * 1e6
+        if chirp < natural:
+            return natural, (
+                "Chirp bandwidth is below 1/PW: no pulse compression, "
+                "treated as unmodulated."
+            )
+        return chirp, None
+
+    if mop == "Phase code":
+        if (mop_param is None or mop_param < 1
+                or abs(mop_param - round(mop_param)) > 1e-9):
+            raise ValueError("Number of chips must be a positive integer.")
+        return round(mop_param) / pw_s, None
+
+    raise ValueError(f"Unknown MOP: {mop}")
+
+
+def make_path_loss(atmos_db_km, rain_db_km, rain_path_km):
+    """Returns f(R_m) -> two-way atmospheric + rain loss in dB."""
+    def path_loss(r_m):
+        r_km = r_m / 1000.0
+        rain_km = r_km if rain_path_km <= 0 else min(r_km, rain_path_km)
+        return 2.0 * atmos_db_km * r_km + 2.0 * rain_db_km * rain_km
+    return path_loss
+
+
+def solve_range(snr_r4, snr_req_db, path_loss):
+    """
+    Solve 10log10(snr_r4 / R^4) - path_loss(R) = snr_req_db for R (m).
+    snr_r4 = SNR * R^4 without path loss. path_loss is non-decreasing in R.
+    """
+    r_free = (snr_r4 / db_to_lin(snr_req_db)) ** 0.25
+    if path_loss(r_free) == 0:
+        return r_free
+
+    def margin(r):
+        return (lin_to_db(snr_r4) - 40 * math.log10(r)
+                - path_loss(r) - snr_req_db)
+
+    lo, hi = r_free * 1e-6, r_free   # margin(lo) > 0, margin(hi) <= 0
+    for _ in range(200):
+        mid = math.sqrt(lo * hi)      # bisection in log space
+        if margin(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return math.sqrt(lo * hi)
+
+
+def pri_lcm_us(pri_list_us):
+    """
+    Least common multiple of the PRIs, computed on a 1 ns grid.
+    Returns (lcm_us, exact). exact is False if a PRI had to be rounded.
+    """
+    ns = [round(p * 1000.0) for p in pri_list_us]
+    if min(ns) < 1:
+        raise ValueError("PRI values must be at least 0.001 us.")
+    exact = all(abs(p * 1000.0 - n) < 1e-6 for p, n in zip(pri_list_us, ns))
+    lcm = ns[0]
+    for v in ns[1:]:
+        lcm = lcm * v // math.gcd(lcm, v)
+    return lcm / 1000.0, exact
+
+
+def pri_gcd_us(pri_list_us):
+    """
+    Greatest common divisor of the PRIs on a 1 ns grid. The PRFs repeat their
+    Doppler folding together every 1 / GCD(PRI) hertz.
+    Returns (gcd_us, exact).
+    """
+    ns = [round(p * 1000.0) for p in pri_list_us]
+    if min(ns) < 1:
+        raise ValueError("PRI values must be at least 0.001 us.")
+    exact = all(abs(p * 1000.0 - n) < 1e-6 for p, n in zip(pri_list_us, ns))
+    g = ns[0]
+    for v in ns[1:]:
+        g = math.gcd(g, v)
+    return g / 1000.0, exact
+
+
+def resolve_range(apparent_m, ru_m, span_m, tol_m, max_candidates=200_000):
+    """
+    Ambiguity resolution from apparent (folded) values measured in several
+    PRIs (used for range in m and for Doppler in Hz). A candidate is R = a0 + k*Ru0 (0 <= R < span) that
+    matches the apparent range of every other PRI within tol_m.
+    Returns the list of consistent candidates (m), or None if the search
+    would need too many candidates.
+    """
+    k_count = int(math.ceil(span_m / ru_m[0] - 1e-9))
+    if k_count > max_candidates:
+        return None
+    found = []
+    for k in range(k_count):
+        r = apparent_m[0] + k * ru_m[0]
+        ok = True
+        for a, ru in zip(apparent_m[1:], ru_m[1:]):
+            d = (r - a) % ru
+            if min(d, ru - d) > tol_m:
+                ok = False
+                break
+        if ok:
+            found.append(r)
+    return found
+
+
+def fft_size(n):
+    """Smallest power of two >= n: FFT length for n coherently processed pulses."""
+    n = int(n)
+    return 1 if n <= 1 else 1 << (n - 1).bit_length()
+
+
+def doppler_metrics(n, pri_s, wavelength, snr_tgt_db, snr_req_db):
+    """
+    Doppler processing of one dwell (n pulses, constant RF and PRI).
+
+    resolution    : df = 1 / (n * PRI) = PRF / n   (rectangular weighting)
+    velocity      : v = lambda * f_D / 2
+    FFT length    : next power of two >= n (zero padded, interpolates only)
+    accuracy      : Cramer-Rao bound of the frequency of a complex tone in
+                    white noise, n samples, post-integration SNR S:
+                    sigma_f = PRF/(2 pi) * sqrt(6 / (S (n^2 - 1)))
+                    (~ 0.39 / (T sqrt(S)) for large n)
+    unambiguous   : Doppler +-PRF/2, velocity +-lambda*PRF/4
+    """
+    prf = 1.0 / pri_s
+    t_coh = n * pri_s
+    df = 1.0 / t_coh
+    nfft = fft_size(n)
+    to_v = wavelength / 2.0                       # Hz -> m/s
+    out = {
+        "t_coh_ms": t_coh * 1e3,
+        "df_res_hz": df, "dv_res": df * to_v,
+        "n_fft": nfft, "fft_pad": nfft - n,
+        "fft_bin_hz": prf / nfft, "fft_bin_v": prf / nfft * to_v,
+        "v_unamb": wavelength * prf / 4.0,
+        "sig_f_tgt": None, "sig_v_tgt": None,
+        "sig_f_thr": None, "sig_v_thr": None,
+    }
+    if n >= 2:
+        def sigma(snr_db):
+            snr = db_to_lin(snr_db)
+            return prf * math.sqrt(6.0 / (snr * (n * n - 1.0))) / (2 * math.pi)
+        out["sig_f_tgt"] = sigma(snr_tgt_db)
+        out["sig_v_tgt"] = out["sig_f_tgt"] * to_v
+        out["sig_f_thr"] = sigma(snr_req_db)
+        out["sig_v_thr"] = out["sig_f_thr"] * to_v
+    return out
+
+
+def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
+               freq_ghz, nf_db, snr_db, temp_k, cpi_ms,
+               gain_dbi, gain_peak_dbi, rcs_m2, target_km,
+               losses, atmos_db_km, rain_db_km=0.0,
+               rain_rate=0.0, rain_path_km=0.0,
+               sources=None, notes=None, n_pulses=None,
+               speed_ms=0.0, radial_ms=0.0):
+    """
+    pri_list_us   : one PRI (PRI Stable) or several PRIs (PRI Switcher).
+                    Each PRI is held for one CPI (dwell). Coherent
+                    integration only happens inside a dwell, where RF and
+                    PRI are constant; dwells are never combined.
+    cpi_ms        : CPI = dwell time per PRI: N = floor(CPI / PRI) pulses.
+    n_pulses      : alternative to cpi_ms: N pulses per dwell (same N for
+                    every PRI, dwell time = N x PRI). Give exactly one of
+                    cpi_ms and n_pulses.
+    speed_ms      : target speed (m/s), level flight along its heading
+    radial_ms     : closing speed toward the radar (m/s, + = approaching) =
+                    speed * cos(elevation) * cos(aspect). Only this component
+                    gives Doppler; the rest is tangential (LOS angular rate).
+    gain_dbi      : antenna gain toward the target (current pointing)
+    gain_peak_dbi : boresight gain (antenna pointed at the target)
+    losses        : dict {key: dB} for every key in LOSS_FIELDS
+    sources       : optional dict {key: "manual" | "table: file.csv"}
+    notes         : optional list of extra warnings
+
+    The top-level result keys (n, int_gain_db, r_coh, margin_db, ...) are
+    those of the limiting dwell (lowest net integration gain); res["dwells"]
+    holds every PRI.
+    """
+    sources = sources or {}
+    pri_list = [float(p) for p in pri_list_us]
+    # ---------- validation ----------
+    if not pri_list:
+        raise ValueError("At least one PRI is required.")
+    if min(pri_list) <= 0 or min(pw_us, bw_mhz, freq_ghz, rcs_m2, temp_k,
+                                 target_km) <= 0:
+        raise ValueError(
+            "PRI, PW, bandwidth, frequency, RCS, temperature "
+            "and target range must be positive."
+        )
+    if (cpi_ms is None) == (n_pulses is None):
+        raise ValueError("Give either the CPI time or the pulse count.")
+    if cpi_ms is not None and cpi_ms <= 0:
+        raise ValueError("CPI must be positive.")
+    if n_pulses is not None and (n_pulses < 1
+                                 or abs(n_pulses - round(n_pulses)) > 1e-9):
+        raise ValueError("Pulses per CPI must be a positive integer.")
+    if speed_ms < 0:
+        raise ValueError("Target speed cannot be negative.")
+    if pw_us > min(pri_list):
+        raise ValueError("PW cannot exceed the shortest PRI.")
+    for key, label, *_ in LOSS_FIELDS:
+        if losses[key] < 0:
+            raise ValueError(f"{label} cannot be negative.")
+    if atmos_db_km < 0 or rain_db_km < 0:
+        raise ValueError("Atmospheric / rain attenuation cannot be negative.")
+    if rain_rate < 0 or rain_path_km < 0:
+        raise ValueError("Rain rate and rain path cannot be negative.")
+
+    warnings = list(notes or [])
+    multi = len(pri_list) > 1
+
+    # ---------- basic quantities ----------
+    peak_w = db_to_lin(p_dbm - 30)
+    pw_s = pw_us * 1e-6
+    wavelength = C / (freq_ghz * 1e9)
+    energy_pulse = peak_w * pw_s
+    f_dop = 2.0 * radial_ms / wavelength        # true Doppler (Hz), + = closing
+
+    # ---------- waveform / MOP ----------
+    b_sig, note = signal_bandwidth_hz(pw_us, mop, mop_param)
+    if note:
+        warnings.append(note)
+    b_rx = bw_mhz * 1e6
+
+    tbp = b_sig * pw_s                       # pulse compression ratio D
+    pc_used = tbp > 1 + 1e-9
+    pc_gain_db = lin_to_db(tbp)
+    eta = min(b_rx / b_sig, b_sig / b_rx)    # bandwidth mismatch factor
+    mismatch_db = max(0.0, -lin_to_db(eta))
+    b_eff = min(b_rx, b_sig)                 # bandwidth actually processed
+    compressed_width_s = 1.0 / b_eff
+    range_res = C / (2 * b_eff)
+
+    # ---------- loss budget (fixed part; integration part per dwell) ----------
+    items = []           # [label, dB, note, is_integration_loss]
+    fixed_db = 0.0       # applies to single pulse and coherent
+    integ_total = 0.0    # applies only to dwells with N > 1
+    for key, label, _default, _typ, scope in LOSS_FIELDS:
+        value = losses[key]
+        name = label.replace(" (dB)", "")
+        src = sources.get(key, "")
+        src = src if src.startswith("table") else ""
+        if scope == "mop" and not pc_used:
+            items.append([name, 0.0, "not applied: no pulse compression", False])
+        elif scope == "integ":
+            integ_total += value
+            items.append([name, value,
+                          "coherent only" + (f", {src}" if src else ""), True])
+        else:
+            fixed_db += value
+            items.append([name, value, src, False])
+    items.append(["BW mismatch", mismatch_db, "computed from B_rx, B_sig", False])
+    fixed_db += mismatch_db
+
+    # ---------- radar equation ----------
+    def snr_r4(gain_db):
+        """SNR1 * R^4 without path loss, for a given antenna gain."""
+        return (energy_pulse * db_to_lin(gain_db) ** 2 * wavelength ** 2
+                * rcs_m2
+                / (FOUR_PI_CUBED * K * temp_k * db_to_lin(nf_db)
+                   * db_to_lin(fixed_db)))
+
+    snr1_r4 = snr_r4(gain_dbi)
+    snr1_r4_bore = snr_r4(gain_peak_dbi)
+
+    path_loss = make_path_loss(atmos_db_km, rain_db_km, rain_path_km)
+    r_single = solve_range(snr1_r4, snr_db, path_loss)
+
+    r_min = C * pw_s / 2
+    r_tgt = target_km * 1000.0
+    tang_ms = math.sqrt(max(speed_ms ** 2 - radial_ms ** 2, 0.0))
+    los_rate_dps = math.degrees(tang_ms / r_tgt)   # LOS angular rate
+    path_tgt_db = path_loss(r_tgt)
+    snr1_tgt_db = lin_to_db(snr1_r4 / r_tgt ** 4) - path_tgt_db
+
+    # ---------- one dwell per PRI ----------
+    dwells = []
+    for p in pri_list:
+        pri_s = p * 1e-6
+        n = (pulse_count(p, cpi_ms) if n_pulses is None
+             else int(round(n_pulses)))
+        integ_db = integ_total if n > 1 else 0.0
+        ideal_db = lin_to_db(n)
+        gain_db = ideal_db - integ_db
+        g_int = db_to_lin(gain_db)
+        ru = C * pri_s / 2
+        apparent = r_tgt % ru                  # folded (apparent) range
+        prf_i = 1.0 / pri_s
+        f_app = (f_dop + prf_i / 2.0) % prf_i - prf_i / 2.0   # folded Doppler
+        eclipsed = apparent < r_min or apparent > ru - r_min
+        margin = snr1_tgt_db + gain_db - snr_db
+        if eclipsed:
+            why = "eclipsed"
+        elif margin < 0:
+            why = "low SNR"
+        else:
+            why = "OK"
+        dwells.append({
+            "pri_us": p, "prf_hz": 1 / pri_s, "n": n,
+            "t_int_ms": n * pri_s * 1e3,
+            "ideal_int_gain_db": ideal_db, "integ_db": integ_db,
+            "int_gain_db": gain_db, "snr1_req_db": snr_db - gain_db,
+            "duty": pw_s / pri_s, "avg_w": peak_w * pw_s / pri_s,
+            "energy_cpi": energy_pulse * n,
+            "r_coh": solve_range(snr1_r4 * g_int, snr_db, path_loss),
+            "r_coh_bore": solve_range(snr1_r4_bore * g_int, snr_db, path_loss),
+            "ru": ru, "apparent": apparent, "eclipsed": eclipsed,
+            "snr_int_tgt_db": snr1_tgt_db + gain_db, "margin_db": margin,
+            "detected": (not eclipsed) and margin >= 0, "why": why,
+            "t_dwell_ms": cpi_ms if n_pulses is None else n * pri_s * 1e3,
+            "dop_app_hz": f_app, "dop_aliased": abs(f_app - f_dop) > 1e-6,
+            "range_migration_m": abs(radial_ms) * n * pri_s,
+            **doppler_metrics(n, pri_s, wavelength, snr1_tgt_db + gain_db,
+                              snr_db),
+        })
+    lim = min(range(len(dwells)), key=lambda i: dwells[i]["int_gain_db"])
+    L = dwells[lim]
+
+    # loss budget as seen by the limiting dwell
+    budget = []
+    for name, value, note_, is_integ in items:
+        if is_integ and L["n"] == 1:
+            budget.append((name, 0.0, "not applied: N = 1"))
+        else:
+            budget.append((name, value, note_))
+
+    # ---------- PRI switching: unambiguous range and ambiguity resolution ----------
+    lcm_us, lcm_exact = pri_lcm_us(pri_list)
+    ru_list = [d["ru"] for d in dwells]
+    ru_total = C * lcm_us * 1e-6 / 2 if multi else ru_list[0]
+    det_idx = [i for i, d in enumerate(dwells) if d["detected"]]
+
+    resolution = {"tol_m": range_res, "candidates": None, "resolved_m": None,
+                  "checked": False, "span_m": None}
+    if multi and len(det_idx) >= 2:
+        sub_lcm_us, _ = pri_lcm_us([pri_list[i] for i in det_idx])
+        cands = resolve_range([dwells[i]["apparent"] for i in det_idx],
+                              [dwells[i]["ru"] for i in det_idx],
+                              C * sub_lcm_us * 1e-6 / 2, range_res)
+        resolution["checked"] = cands is not None
+        resolution["candidates"] = cands
+        resolution["span_m"] = C * sub_lcm_us * 1e-6 / 2
+        if cands is not None and len(cands) == 1:
+            resolution["resolved_m"] = cands[0]
+
+    # ---------- Doppler: unambiguous span and ambiguity resolution ----------
+    gcd_us, _ = pri_gcd_us(pri_list)
+    dop_span = 1e6 / gcd_us if multi else dwells[0]["prf_hz"]       # Hz
+    dres = {"checked": False, "candidates": None, "resolved_hz": None,
+            "tol_hz": None, "span_hz": None}
+    if multi and len(det_idx) >= 2:
+        sub = [dwells[i] for i in det_idx]
+        g_sub, _ = pri_gcd_us([d["pri_us"] for d in sub])
+        span_sub = 1e6 / g_sub
+        tol_f = max(d["df_res_hz"] for d in sub)
+        cands_f = resolve_range([d["dop_app_hz"] % d["prf_hz"] for d in sub],
+                                [d["prf_hz"] for d in sub], span_sub, tol_f)
+        dres.update(tol_hz=tol_f, span_hz=span_sub,
+                    checked=cands_f is not None, candidates=cands_f)
+        if cands_f is not None and len(cands_f) == 1:
+            c = cands_f[0]
+            dres["resolved_hz"] = c if c < span_sub / 2 else c - span_sub
+
+    # ---------- status ----------
+    first = dwells[0]
+    if not det_idx:
+        reasons = sorted({d["why"] for d in dwells})
+        if reasons == ["eclipsed"]:
+            detail = (f"target eclipsed, apparent range "
+                      f"{first['apparent']/1000:.3f} km" if not multi
+                      else "target eclipsed in every PRI")
+        elif reasons == ["low SNR"]:
+            detail = "SNR below required"
+        else:
+            detail = "eclipsed or SNR below required"
+        kind, status_text = "bad", f"NOT DETECTED ({detail})"
+    elif not multi:
+        if r_tgt <= ru_list[0]:
+            kind, status_text = "ok", "DETECTED"
+        else:
+            kind = "warn"
+            status_text = (f"DETECTED, RANGE AMBIGUOUS (apparent range "
+                           f"{first['apparent']/1000:.3f} km)")
+    elif len(det_idx) == 1:
+        kind = "warn"
+        status_text = (f"DETECTED IN 1 OF {len(dwells)} PRIs, "
+                       "RANGE AMBIGUOUS")
+    else:
+        cands = resolution["candidates"]
+        n_det = f"{len(det_idx)} OF {len(dwells)} PRIs"
+        if cands is None:
+            kind = "warn"
+            status_text = (f"DETECTED IN {n_det}, ambiguity check skipped "
+                           "(PRI set needs too many candidates)")
+        elif len(cands) == 1 and r_tgt >= ru_total:
+            kind = "warn"
+            status_text = (f"DETECTED IN {n_det}, RANGE FOLDED (beyond the "
+                           f"{ru_total/1000:,.1f} km PRI-switching range)")
+        elif len(cands) == 1:
+            kind = "ok"
+            status_text = (f"DETECTED IN {n_det}, RANGE RESOLVED "
+                           f"({cands[0]/1000:.3f} km)")
+        else:
+            kind = "warn"
+            status_text = (f"DETECTED IN {n_det}, RANGE AMBIGUOUS "
+                           f"({len(cands)} candidates)")
+
+    # ---------- what the radar finds: range and Doppler ----------
+    # unambiguous range / Doppler of the PRIs that actually detected the target
+    ru_eff = resolution["span_m"] if resolution["span_m"] else ru_total
+    dop_span_eff = dres["span_hz"] if dres["span_hz"] else dop_span
+    first_det = dwells[det_idx[0]] if det_idx else None
+    if not det_idx:
+        meas = {"range_m": None, "range_state": "none",
+                "dop_hz": None, "dop_state": "none"}
+    elif not multi:
+        meas = {"range_m": first_det["apparent"],
+                "range_state": "ok" if r_tgt <= ru_list[0] else "folded",
+                "dop_hz": first_det["dop_app_hz"],
+                "dop_state": "aliased" if first_det["dop_aliased"] else "ok"}
+    else:
+        if resolution["resolved_m"] is not None:
+            r_val = resolution["resolved_m"]
+            r_state = "resolved" if r_tgt < ru_eff else "folded"
+        else:
+            r_val, r_state = first_det["apparent"], "ambiguous"
+        if dres["resolved_hz"] is not None:
+            d_val = dres["resolved_hz"]
+            d_state = "resolved" if abs(f_dop) < dop_span_eff / 2 else "folded"
+        else:
+            d_val, d_state = first_det["dop_app_hz"], "ambiguous"
+        meas = {"range_m": r_val, "range_state": r_state,
+                "dop_hz": d_val, "dop_state": d_state}
+    if kind == "ok" and meas["dop_state"] in ("aliased", "ambiguous", "folded"):
+        kind = "warn"
+        status_text += ", DOPPLER " + meas["dop_state"].upper()
+
+    pointing_loss_db = 2.0 * (gain_peak_dbi - gain_dbi)   # two-way
+
+    # ---------- warnings ----------
+    if not multi:
+        if r_tgt > ru_list[0]:
+            warnings.append(
+                f"Target is beyond the unambiguous range "
+                f"({ru_list[0]/1000:.3f} km): it appears at the folded range "
+                f"{first['apparent']/1000:.3f} km. Use PRI Switcher to "
+                "resolve it."
+            )
+        if L["r_coh"] > ru_list[0]:
+            warnings.append(
+                "Detection range exceeds unambiguous range: targets beyond "
+                "it will fold (range ambiguity)."
+            )
+    else:
+        bad = [str(i + 1) for i, d in enumerate(dwells) if d["eclipsed"]]
+        if bad:
+            warnings.append(
+                f"Target is eclipsed in PRI {', '.join(bad)} (echo overlaps "
+                "a transmit pulse); the other PRIs are used for detection.")
+        if L["r_coh"] > ru_total:
+            warnings.append(
+                "Detection range exceeds the PRI-switching unambiguous "
+                "range (LCM of the PRIs).")
+        if not lcm_exact:
+            warnings.append("PRIs were rounded to 1 ns to compute the LCM.")
+        if len(det_idx) >= 2 and resolution["candidates"] is not None \
+                and len(resolution["candidates"]) > 1:
+            warnings.append(
+                "PRI set does not resolve the ambiguity within one range "
+                "cell: choose PRIs that are more different from each other.")
+    if pointing_loss_db > 6.0:
+        warnings.append(
+            f"Target is outside the antenna main beam "
+            f"({pointing_loss_db:.1f} dB two-way pointing loss)."
+        )
+    if mismatch_db > 0.5:
+        side = "wider" if b_rx > b_sig else "narrower"
+        warnings.append(
+            f"Receiver BW is {side} than the signal BW: "
+            f"{mismatch_db:.2f} dB mismatch loss (simplified model)."
+        )
+    if L["n"] > 1 and L["int_gain_db"] < 0:
+        warnings.append(
+            "Integration-related losses exceed 10log10(N): "
+            "integration reduces SNR."
+        )
+
+    if det_idx and not multi and dwells[0]["dop_aliased"]:
+        d0 = dwells[0]
+        warnings.append(
+            f"Target Doppler {f_dop:+,.0f} Hz is outside +-PRF/2 "
+            f"(+-{d0['prf_hz']/2:,.0f} Hz): it is aliased to "
+            f"{d0['dop_app_hz']:+,.0f} Hz. Use PRI Switcher or a higher PRF.")
+    if multi and det_idx and meas["dop_state"] == "ambiguous" \
+            and len(det_idx) >= 2:
+        warnings.append(
+            "The PRFs do not resolve the Doppler ambiguity within one "
+            "Doppler resolution cell: use PRIs that are more different.")
+    mig = max(d["range_migration_m"] for d in dwells)
+    if mig > range_res:
+        warnings.append(
+            f"Target moves {mig:.1f} m during the coherent time, more than "
+            f"the range resolution ({range_res:.1f} m): range migration "
+            "reduces the integration gain (not modeled).")
+    if multi and abs(radial_ms) * sum(d["t_dwell_ms"] for d in dwells) \
+            * 1e-3 > range_res:
+        warnings.append(
+            "Target moves more than a range cell during the PRI cycle: the "
+            "apparent ranges of the dwells may not match (range change "
+            "between dwells is not modeled).")
+    one = [str(i + 1) for i, d in enumerate(dwells) if d["n"] == 1]
+    if one:
+        warnings.append(
+            "Only 1 pulse per dwell in PRI " + ", ".join(one)
+            + ": no Doppler processing (Doppler resolution = PRF).")
+
+    return {
+        "mop": mop,
+        "mop_param": mop_param,
+        "pw_us": pw_us,
+        "snr_req_db": snr_db,
+        "freq_ghz": freq_ghz,
+        "peak_w": peak_w,
+        "wavelength": wavelength,
+        "energy_pulse": energy_pulse,
+        "b_sig": b_sig,
+        "b_rx": b_rx,
+        "tbp": tbp,
+        "pc_gain_db": pc_gain_db,
+        "mismatch_db": mismatch_db,
+        "compressed_width_s": compressed_width_s,
+        "range_res": range_res,
+        # --- PRI handling ---
+        "pri_mode": "switch" if multi else "stable",
+        "pri_list": pri_list,
+        "cpi_mode": "time" if n_pulses is None else "count",
+        "cpi_ms": cpi_ms,
+        "dwells": dwells,
+        "lim": lim,
+        "cycle_ms": sum(d["t_dwell_ms"] for d in dwells),
+        "lcm_us": lcm_us,
+        "ru_total": ru_total,
+        "ru_min": min(ru_list),
+        "ru_max": max(ru_list),
+        "resolution": resolution,
+        "dop_resolution": dres,
+        "meas": meas,
+        "speed_ms": speed_ms,
+        "radial_ms": radial_ms,
+        "tang_ms": tang_ms,
+        "los_rate_dps": los_rate_dps,
+        "f_dop_hz": f_dop,
+        "dop_span_hz": dop_span,
+        "dop_unamb_ms": wavelength * dop_span / 4.0,
+        "ru_eff": ru_eff,
+        "dop_span_eff_hz": dop_span_eff,
+        "status_kind": kind,
+        "status_text": status_text,
+        # --- limiting dwell (kept for the plots and the text) ---
+        "avg_w": L["avg_w"],
+        "duty": L["duty"],
+        "prf_hz": L["prf_hz"],
+        "energy_cpi": L["energy_cpi"],
+        "n": L["n"],
+        "t_int_ms": L["t_int_ms"],
+        "ideal_int_gain_db": L["ideal_int_gain_db"],
+        "int_gain_db": L["int_gain_db"],
+        "snr1_req_db": L["snr1_req_db"],
+        "budget": budget,
+        "fixed_db": fixed_db,
+        "integ_db": L["integ_db"],
+        "atmos_db_km": atmos_db_km,
+        "atmos_source": sources.get("atmos", "manual"),
+        "rain_db_km": rain_db_km,
+        "rain_rate": rain_rate,
+        "rain_path_km": rain_path_km,
+        "path_single_db": path_loss(r_single),
+        "path_coh_db": path_loss(L["r_coh"]),
+        "gain_dbi": gain_dbi,
+        "gain_peak_dbi": gain_peak_dbi,
+        "gain_source": sources.get("gain", "manual"),
+        "pointing_loss_db": pointing_loss_db,
+        "rcs_m2": rcs_m2,
+        "rcs_source": sources.get("rcs", "manual"),
+        "r_single": r_single,
+        "r_coh": L["r_coh"],
+        "r_coh_bore": L["r_coh_bore"],
+        "target_km": target_km,
+        "path_tgt_db": path_tgt_db,
+        "snr1_tgt_db": snr1_tgt_db,
+        "snr_int_tgt_db": L["snr_int_tgt_db"],
+        "margin_db": L["margin_db"],
+        "detected": kind == "ok",
+        "r_unamb": ru_total,
+        "r_min": r_min,
+        "warnings": warnings,
+    }
+
+
+def evaluate(inp, tables):
+    """
+    Resolve tables and geometry, then run the radar equation.
+
+    inp keys:
+      p_dbm, pri_mode ("stable"/"switch"), pri_list [us], pw, mop,
+      mop_param, bw, freq, nf, snr, temp,
+      cpi (ms, dwell per PRI) or n_pulses (N per dwell) - exactly one,
+      tgt_speed (m/s, along the heading, level flight; default 0),
+      pol ("H"/"V"/"C"), ant_az, ant_el,
+      gain_table (bool), gain_manual,
+      rcs_table (bool), rcs_manual,
+      tgt_range, tgt_az, tgt_el, tgt_heading,
+      loss_table {key: bool}, loss_manual {key: float or None},
+      rain_rate, rain_path, notes (optional list)
+    """
+    notes = list(inp.get("notes", []))
+    pri_list = list(inp.get("pri_list") or [inp["pri"]])
+    if inp.get("pri_mode") == "switch" and len(pri_list) < 2:
+        raise ValueError("PRI Switcher needs at least 2 PRIs "
+                         "(comma separated list).")
+    used_dummy = set()
+    freq, pol = inp["freq"], inp["pol"]
+    if freq <= 0:
+        raise ValueError("Frequency must be positive.")
+    if not -90 <= inp["tgt_el"] <= 90 or not -90 <= inp["ant_el"] <= 90:
+        raise ValueError("Elevation angles must be between -90 and 90 deg.")
+
+    def use(name):
+        tbl = tables.get(name)
+        if tbl is None:
+            raise ValueError(f"Table {name}.csv is not available.")
+        if tbl.get("dummy"):
+            used_dummy.add(tbl["source"])
+        return f"table: {tbl['source']}"
+
+    sources = {}
+
+    # ---- geometry ----
+    az_off, el_off, tot_off = off_boresight(
+        inp["tgt_az"], inp["tgt_el"], inp["ant_az"], inp["ant_el"])
+    aspect = aspect_angle(inp["tgt_heading"], inp["tgt_az"])
+    speed = float(inp.get("tgt_speed", 0.0))
+    if speed < 0:
+        raise ValueError("Target speed cannot be negative.")
+    # closing speed: horizontal velocity along the heading projected on the
+    # line of sight (3D: cos(elevation) * cos(aspect))
+    radial = (speed * math.cos(math.radians(inp["tgt_el"]))
+              * math.cos(math.radians(aspect)))
+
+    # ---- antenna gain ----
+    if inp["gain_table"]:
+        sources["gain"] = use("antenna_gain")
+        gain, peak, n_ = antenna_gain(tables, freq, az_off, el_off)
+        notes += n_
+    else:
+        gain = peak = inp["gain_manual"]
+        sources["gain"] = "manual"
+        if tot_off > 0.05:
+            notes.append("Manual antenna gain: antenna pointing has no "
+                         "effect (constant gain).")
+
+    # ---- RCS ----
+    if inp["rcs_table"]:
+        sources["rcs"] = use("rcs")
+        rcs, n_ = rcs_value(tables, freq, aspect, pol)
+        notes += n_
+    else:
+        rcs = inp["rcs_manual"]
+        sources["rcs"] = "manual"
+
+    # ---- losses ----
+    values = {}
+    for key in [k for k, *_ in LOSS_FIELDS] + [ATMOS_FIELD[0]]:
+        if inp["loss_table"].get(key):
+            sources[key] = use(key)
+            value, note = table_value(tables, key, freq, pol)
+            if note:
+                notes.append(note)
+        else:
+            value = inp["loss_manual"][key]
+            if value is None:
+                raise ValueError(f"Missing value for {key}.")
+            sources[key] = "manual"
+        values[key] = value
+
+    # ---- rain (polarisation and path elevation dependent) ----
+    if inp["rain_rate"] < 0:
+        raise ValueError("Rain rate cannot be negative.")
+    if inp["rain_rate"] > 0:
+        use("rain_coeffs")
+    rain_db_km, note = rain_attenuation(
+        tables, freq, inp["rain_rate"], pol, abs(inp["tgt_el"]))
+    if note:
+        notes.append(note)
+
+    if used_dummy:
+        notes.insert(0, "DUMMY tables in use: " + ", ".join(sorted(used_dummy))
+                     + ". Replace them with real data.")
+
+    res = radar_calc(
+        p_dbm=inp["p_dbm"], pri_list_us=pri_list, pw_us=inp["pw"],
+        mop=inp["mop"], mop_param=inp["mop_param"], bw_mhz=inp["bw"],
+        freq_ghz=freq, nf_db=inp["nf"], snr_db=inp["snr"],
+        temp_k=inp["temp"], cpi_ms=inp.get("cpi"),
+        n_pulses=inp.get("n_pulses"), speed_ms=speed, radial_ms=radial,
+        gain_dbi=gain, gain_peak_dbi=peak, rcs_m2=rcs,
+        target_km=inp["tgt_range"],
+        losses={k: values[k] for k, *_ in LOSS_FIELDS},
+        atmos_db_km=values["atmos"], rain_db_km=rain_db_km,
+        rain_rate=inp["rain_rate"], rain_path_km=inp["rain_path"],
+        sources=sources, notes=notes,
+    )
+    res.update({
+        "pol": pol,
+        "ant_az": inp["ant_az"], "ant_el": inp["ant_el"],
+        "tgt_az": inp["tgt_az"], "tgt_el": inp["tgt_el"],
+        "tgt_heading": inp["tgt_heading"], "aspect": aspect,
+        "az_off": az_off, "el_off": el_off, "tot_off": tot_off,
+        "loss_values": values,
+    })
+    return res
+
+
+def target_summary(res, short=False):
+    """Texts for the target motion and for what the radar finds."""
+    lam = res["wavelength"]
+    m = res["meas"]
+    multi = res["pri_mode"] == "switch"
+    vr = res["radial_ms"]
+    sense = ("closing" if vr > 1e-9 else "receding" if vr < -1e-9
+             else "no radial motion")
+    tag = {"ok": "", "folded": " (folded)", "resolved": " (resolved)",
+           "ambiguous": " (ambiguous)", "aliased": " (aliased)"}
+    out = {
+        "radial": f"{vr:+.2f} m/s ({sense})",
+        "angrate": f"{res['los_rate_dps']:.3f} deg/s  "
+                   f"(tangential {res['tang_ms']:.1f} m/s)",
+        "dop_true": f"{res['f_dop_hz']:+,.1f} Hz",
+    }
+    if m["range_m"] is None:
+        out["range_found"] = "not detected"
+        out["dop_found"] = "not detected"
+    else:
+        out["range_found"] = (f"{m['range_m']/1000:,.3f} km"
+                              f"{tag[m['range_state']]}")
+        out["dop_found"] = (f"{m['dop_hz']:+,.1f} Hz = "
+                            f"{m['dop_hz'] * lam / 2:+.2f} m/s"
+                            f"{tag[m['dop_state']]}")
+    if multi:
+        ru, span = res["ru_eff"], res["dop_span_eff_hz"]
+        partial = (abs(ru - res["r_unamb"]) > 1e-6
+                   or abs(span - res["dop_span_hz"]) > 1e-6)
+        what = "detected PRIs" if partial else "PRIs"
+    else:
+        ru, span = res["r_unamb"], res["dop_span_hz"]
+    v_amb = lam * span / 4.0
+    out["ru"] = (f"{ru/1000:,.1f} km" if multi else f"{ru/1000:,.3f} km")
+    out["dop_unamb"] = f"+-{span/2:,.0f} Hz = +-{v_amb:.1f} m/s"
+    if multi and not short:
+        out["ru"] += f"  (LCM of the {what})"
+        out["dop_unamb"] += f"  (1 / GCD of the {what})"
+    return out
+
+
+def target_measure_lines(res, line):
+    """What the radar finds, for the TARGET block of the results text."""
+    s = target_summary(res)
+    out = [line("Range found", s["range_found"]),
+           line("Doppler found", s["dop_found"])]
+    if res["pri_mode"] == "switch":
+        out.append(line("Apparent Doppler / PRI", "  ".join(
+            f"{d['dop_app_hz']:+,.0f}" for d in res["dwells"]) + " Hz"))
+        dr = res["dop_resolution"]
+        if dr["candidates"] is not None and len(dr["candidates"]) > 1:
+            span = dr["span_hz"]
+            shown = ", ".join(
+                f"{(c if c < span / 2 else c - span):+,.0f}"
+                for c in dr["candidates"][:4])
+            more = " ..." if len(dr["candidates"]) > 4 else ""
+            out.append(line("Doppler candidates", f"{shown}{more} Hz"))
+    out += [line("Unambiguous range", s["ru"]),
+            line("Unambiguous Doppler", s["dop_unamb"])]
+    return out
+
+
+def doppler_lines(res, line):
+    """DOPPLER / FFT section of the results text."""
+    dw = res["dwells"]
+    lim = res["lim"]
+    out = ["DOPPLER / FFT"]
+    if res["pri_mode"] == "stable":
+        d = dw[0]
+        out += [
+            line("PRF", f"{d['prf_hz']:,.2f} Hz  (1 / PRI {d['pri_us']:g} us)"),
+            line("Coherent time (N x PRI)",
+                 f"{d['t_coh_ms']:.3f} ms  (N = {d['n']})"),
+            line("Doppler resolution",
+                 f"{d['df_res_hz']:,.2f} Hz = {d['dv_res']:.3f} m/s "
+                 f"({d['dv_res']*3.6:.2f} km/h)"),
+            line("FFT points",
+                 f"{d['n_fft']}  (next power of 2 >= N, zero padding "
+                 f"{d['fft_pad']})"),
+            line("FFT bin spacing",
+                 f"{d['fft_bin_hz']:,.2f} Hz = {d['fft_bin_v']:.3f} m/s"),
+        ]
+        if d["sig_f_tgt"] is not None:
+            out += [
+                line("Doppler accuracy @ target",
+                     f"{d['sig_f_tgt']:.3g} Hz = {d['sig_v_tgt']:.3g} m/s  "
+                     f"(1 sigma, SNR {d['snr_int_tgt_db']:.1f} dB)"),
+                line("Doppler accuracy @ threshold",
+                     f"{d['sig_f_thr']:.3g} Hz = {d['sig_v_thr']:.3g} m/s  "
+                     f"(1 sigma, SNR {res['snr_req_db']:.1f} dB)"),
+            ]
+        else:
+            out.append(line("Doppler accuracy",
+                            "n/a (N = 1: no Doppler processing)"))
+        out.append(line("Unambiguous Doppler",
+                        f"+-{d['prf_hz']/2:,.0f} Hz = +-{d['v_unamb']:.1f} m/s "
+                        f"(+-{d['v_unamb']*3.6:.0f} km/h)"))
+    else:
+        out.append(
+            f"  {'#':>2} {'PRF(Hz)':>10} {'Tcoh(ms)':>9} {'dF(Hz)':>8} "
+            f"{'dV(m/s)':>8} {'NFFT':>6} {'sigF(Hz)':>9} {'sigV(m/s)':>10} "
+            f"{'Vamb(m/s)':>10}")
+        for i, d in enumerate(dw):
+            sf = f"{d['sig_f_tgt']:.3g}" if d["sig_f_tgt"] is not None else "n/a"
+            sv = f"{d['sig_v_tgt']:.3g}" if d["sig_v_tgt"] is not None else "n/a"
+            out.append(
+                f"  {i+1:>2} {d['prf_hz']:>10,.1f} {d['t_coh_ms']:>9.3f} "
+                f"{d['df_res_hz']:>8.2f} {d['dv_res']:>8.3f} {d['n_fft']:>6} "
+                f"{sf:>9} {sv:>10} {d['v_unamb']:>10.1f}")
+        out.append("  dF = 1/Tcoh, dV = lambda*dF/2, sig = 1-sigma at the "
+                   "target SNR, Vamb = +-lambda*PRF/4")
+        d = dw[lim]
+        if d["sig_f_thr"] is not None:
+            out.append(line(
+                f"Accuracy @ threshold (PRI {lim+1})",
+                f"{d['sig_f_thr']:.3g} Hz = {d['sig_v_thr']:.3g} m/s  "
+                f"(SNR {res['snr_req_db']:.1f} dB)"))
+    out.append("")
+    return out
+
+
+def format_result(res, table_dir=None):
+    w = 28  # label column width
+
+    def line(label, value):
+        return f"  {label:<{w}}: {value}"
+
+    def span(values, fmt):
+        lo, hi = min(values), max(values)
+        return fmt.format(lo) if fmt.format(lo) == fmt.format(hi) \
+            else f"{fmt.format(lo)} - {fmt.format(hi)}"
+
+    pol_name = {"H": "H (horizontal)", "V": "V (vertical)",
+                "C": "Circular"}[res["pol"]]
+    switch = res["pri_mode"] == "switch"
+    dw = res["dwells"]
+    lim = res["lim"]
+    s_t = target_summary(res)
+    if res["cpi_mode"] == "time":
+        dwell_txt = f"each held for one CPI = {res['cpi_ms']:g} ms"
+    else:
+        dwell_txt = f"each dwell = {dw[0]['n']} pulses"
+
+    out = [
+        f"TARGET STATUS: {res['status_text']}",
+        f"  margin {res['margin_db']:+.2f} dB"
+        + (" (worst PRI)" if switch else "")
+        + f" at {res['target_km']:,.2f} km",
+        "",
+        "DETECTION RANGE (target direction)",
+        line("Coherent, current pointing", f"{res['r_coh']/1000:,.3f} km"
+             + ("  (limiting PRI)" if switch else "")),
+        line("Coherent, antenna on target", f"{res['r_coh_bore']/1000:,.3f} km  (optimum)"),
+    ]
+    if switch:
+        out.append(line("Coherent, best PRI",
+                        f"{max(d['r_coh'] for d in dw)/1000:,.3f} km"))
+    out += [
+        line("Single pulse, current", f"{res['r_single']/1000:,.3f} km"),
+        "",
+    ]
+
+    if switch:
+        r = res["resolution"]
+        out += [
+            f"PRI SWITCHING  ({len(dw)} PRIs, {dwell_txt}, "
+            f"cycle {res['cycle_ms']:g} ms)",
+            f"  {'#':>2} {'PRI(us)':>9} {'N':>6} {'Gain(dB)':>9} "
+            f"{'Rcoh(km)':>9} {'Ru(km)':>8} {'Apparent(km)':>13} "
+            f"{'Margin(dB)':>11}  Result",
+        ]
+        for i, d in enumerate(dw):
+            mark = " *" if i == lim else ""
+            out.append(
+                f"  {i+1:>2} {d['pri_us']:>9.3f} {d['n']:>6,} "
+                f"{d['int_gain_db']:>9.2f} {d['r_coh']/1000:>9.2f} "
+                f"{d['ru']/1000:>8.2f} {d['apparent']/1000:>13.3f} "
+                f"{d['margin_db']:>11.2f}  {d['why']}{mark}")
+        out += [
+            "  * limiting dwell (lowest net integration gain)",
+            line("PRI LCM", f"{res['lcm_us']/1000:,.3f} ms"),
+            line("Unambiguous range (LCM)", f"{res['ru_total']/1000:,.2f} km"),
+            line("Match tolerance", f"{r['tol_m']:,.1f} m  (range resolution)"),
+        ]
+        if r["resolved_m"] is not None:
+            out.append(line("Resolved target range",
+                            f"{r['resolved_m']/1000:,.3f} km"))
+        elif r["candidates"] is not None and len(r["candidates"]) > 1:
+            shown = ", ".join(f"{c/1000:,.3f}" for c in r["candidates"][:4])
+            more = " ..." if len(r["candidates"]) > 4 else ""
+            out.append(line("Candidate ranges", f"{shown}{more} km"))
+        else:
+            out.append(line("Resolved target range",
+                            "not available (needs detection in >= 2 PRIs)"
+                            if r["candidates"] is None and r["checked"] is False
+                            and sum(d["detected"] for d in dw) < 2
+                            else "not available"))
+        out.append("")
+
+    out += [
+        "TARGET",
+        line("Range", f"{res['target_km']:,.3f} km"),
+        line("Azimuth / elevation", f"{res['tgt_az']:.2f} / {res['tgt_el']:.2f} deg"),
+        line("Heading / speed", f"{res['tgt_heading']:.2f} deg / "
+             f"{res['speed_ms']:g} m/s ({res['speed_ms']*3.6:.0f} km/h)"),
+        line("Aspect angle", f"{res['aspect']:.2f} deg  (0 nose-on, 180 tail-on)"),
+        line("Radial velocity", s_t["radial"]),
+        line("LOS angular rate", s_t["angrate"]),
+        line("Doppler (true)", s_t["dop_true"]),
+        line("RCS", f"{res['rcs_m2']:.4g} m^2 = "
+                    f"{lin_to_db(res['rcs_m2']):.2f} dBsm  ({res['rcs_source']})"),
+        line("Path loss to target", f"{res['path_tgt_db']:.2f} dB  (2-way)"),
+        line("Single-pulse SNR", f"{res['snr1_tgt_db']:.2f} dB"),
+        line("Integrated SNR", f"{res['snr_int_tgt_db']:.2f} dB"
+             + ("  (limiting PRI)" if switch else "")),
+        line("Margin vs required SNR", f"{res['margin_db']:+.2f} dB"),
+        *target_measure_lines(res, line),
+        "",
+        "ANTENNA",
+        line("Pointing az / el", f"{res['ant_az']:.2f} / {res['ant_el']:.2f} deg"),
+        line("Polarisation", pol_name),
+        line("Off-boresight az / el",
+             f"{res['az_off']:+.2f} / {res['el_off']:+.2f} deg"),
+        line("Off-boresight total", f"{res['tot_off']:.2f} deg"),
+        line("Gain toward target", f"{res['gain_dbi']:.2f} dBi  ({res['gain_source']})"),
+        line("Peak (boresight) gain", f"{res['gain_peak_dbi']:.2f} dBi"),
+        line("Pointing loss", f"{res['pointing_loss_db']:.2f} dB  (2-way)"),
+        "",
+        "WAVEFORM",
+        line("MOP", res["mop"]),
+        line("Signal bandwidth", f"{res['b_sig']/1e6:,.3f} MHz"),
+        line("Receiver bandwidth", f"{res['b_rx']/1e6:,.3f} MHz"),
+        line("Compression ratio (B*tau)", f"{res['tbp']:,.2f}"),
+        line("Pulse compression gain", f"{res['pc_gain_db']:.2f} dB"),
+        line("Compressed pulse width",
+             f"{res['compressed_width_s']*1e6:,.4f} us"),
+        line("Range resolution", f"{res['range_res']:,.2f} m"),
+        "",
+        "INTEGRATION" + (f"  (limiting dwell: PRI {lim+1} = "
+                         f"{dw[lim]['pri_us']:g} us)" if switch else ""),
+    ]
+    out.append(line("CPI defined by",
+                    "time: N = floor(CPI / PRI)" if res["cpi_mode"] == "time"
+                    else "pulse count: CPI = N x PRI"))
+    if switch and res["cpi_mode"] == "time":
+        out.append(line("Dwell time per PRI (CPI)", f"{res['cpi_ms']:g} ms"))
+    out += [
+        line("Pulse count N", f"{res['n']:,}"),
+        line("CPI used (N x PRI)", f"{res['t_int_ms']:.3f} ms"),
+        line("Ideal gain (10log10 N)", f"{res['ideal_int_gain_db']:.2f} dB"),
+        line("Integration-related losses", f"{res['integ_db']:.2f} dB"),
+        line("Net integration gain", f"{res['int_gain_db']:.2f} dB"),
+        line("Required single-pulse SNR", f"{res['snr1_req_db']:.2f} dB"),
+        "",
+    ]
+    out += doppler_lines(res, line)
+    out += [
+        f"LOSS BUDGET  (at {res['freq_ghz']:g} GHz, {pol_name})",
+    ]
+
+    for name, value, note in res["budget"]:
+        suffix = f"  ({note})" if note else ""
+        out.append(line(name, f"{value:5.2f} dB{suffix}"))
+
+    if res["rain_rate"] > 0:
+        rain_txt = f"{res['rain_rate']:g} mm/h, "
+        rain_txt += ("full path" if res["rain_path_km"] <= 0
+                     else f"first {res['rain_path_km']:g} km")
+        rain_txt += f", pol {res['pol']}"
+    else:
+        rain_txt = "no rain"
+
+    out += [
+        line("Atmospheric, 1-way",
+             f"{res['atmos_db_km']:.4f} dB/km  ({res['atmos_source']})"),
+        line("Rain, 1-way",
+             f"{res['rain_db_km']:.4f} dB/km  ({rain_txt})"),
+        line("Path loss @ single range", f"{res['path_single_db']:5.2f} dB  (2-way)"),
+        line("Path loss @ coherent range", f"{res['path_coh_db']:5.2f} dB  (2-way)"),
+        "  " + "-" * 44,
+        line("Total, single pulse",
+             f"{res['fixed_db'] + res['path_single_db']:5.2f} dB"),
+        line("Total, coherent",
+             f"{res['fixed_db'] + res['integ_db'] + res['path_coh_db']:5.2f} dB"),
+        "  (pointing loss is in the antenna gain, not in this total)",
+        "",
+        "POWER / ENERGY",
+        line("Peak power", f"{res['peak_w']:,.3f} W"),
+        line("Duty cycle", span([100 * d["duty"] for d in dw], "{:.3f} %")),
+        line("Average power", span([d["avg_w"] for d in dw], "{:,.3f} W")),
+        line("Energy per pulse", f"{res['energy_pulse']:.4g} J"),
+        line("Energy per CPI", span([d["energy_cpi"] for d in dw], "{:.4g} J")),
+        line("PRF", span([d["prf_hz"] for d in dw], "{:,.2f} Hz")),
+        line("Wavelength", f"{res['wavelength']:.6f} m"),
+        "",
+        "RANGE LIMITS",
+    ]
+    if switch:
+        out += [
+            line("Unambiguous range per PRI",
+                 f"{res['ru_min']/1000:,.3f} - {res['ru_max']/1000:,.3f} km"),
+            line("Unambiguous range (LCM)", f"{res['ru_total']/1000:,.2f} km"),
+        ]
+    else:
+        out.append(line("Unambiguous range", f"{res['r_unamb']/1000:,.3f} km"))
+        if res["target_km"] * 1000 > res["r_unamb"]:
+            out.append(line("Apparent (folded) range",
+                            f"{dw[0]['apparent']/1000:,.3f} km"))
+    out.append(line("Minimum (eclipse) range", f"{res['r_min']/1000:,.3f} km"))
+
+    if res["warnings"]:
+        out += ["", "WARNINGS"] + [f"  ! {msg}" for msg in res["warnings"]]
+
+    out += [
+        "",
+        "ASSUMPTIONS",
+        "  - Noise-limited, free-space propagation: no multipath /",
+        "    propagation factor, no clutter, no jamming.",
+        "  - Monostatic: same antenna, gain and polarisation on TX and RX.",
+        "  - Required SNR is entered for the chosen Pd/Pfa; target",
+        "    fluctuation (Swerling) loss is not modeled unless it",
+        "    is added to Other losses.",
+        "  - Antenna gain toward a direction = az cut + el cut - peak (dB).",
+        "  - Aspect angle in the horizontal plane only.",
+        "  - Polarisation acts through the RCS table, rain attenuation",
+        "    (ITU-R P.838) and any loss table with H/V/C columns;",
+        "    gaseous attenuation is polarisation independent.",
+        "  - BW mismatch: simplified min(B_rx/B_sig, B_sig/B_rx),",
+        "    added in addition to the matched filter loss.",
+        "  - Coherent integration only while RF and PRI are constant",
+        "    (one CPI / dwell); ideal apart from listed losses; target",
+        "    stays in one range cell during the dwell.",
+        "  - PRI Switcher: each PRI is held for one CPI; dwells are not",
+        "    combined, they only resolve the range ambiguity.",
+        "  - Target: level flight at constant speed along its heading.",
+        "    Doppler uses the radial component v*cos(el)*cos(aspect);",
+        "    tangential motion gives no Doppler (monostatic) and only",
+        "    sets the LOS angular rate. No clutter: blind speeds and the",
+        "    zero-Doppler notch are not penalised.",
+        "  - Doppler ambiguity: folded Doppler of each PRF matched within",
+        "    one Doppler-resolution cell; unambiguous span 1/GCD(PRI).",
+        "  - Doppler resolution = 1 / (N x PRI), rectangular weighting;",
+    "    a window widens it (about 1.3x for Hamming). FFT length = next",
+    "    power of two >= N (zero padding only interpolates).",
+    "  - Doppler accuracy = Cramer-Rao bound for one tone in white",
+    "    noise at the post-integration SNR (checked by simulation down",
+    "    to 13 dB); real estimators are a bit worse, and near the",
+    "    threshold rare outliers (wrong FFT bin) raise the rms error.",
+    "  - Eclipsing: an echo is lost if its apparent range is within",
+        "    c*PW/2 of a transmit pulse (start or end of the PRI).",
+        "  - Ambiguity resolution: apparent ranges matched within one",
+        "    range-resolution cell, needs detection in >= 2 PRIs.",
+        "  - Atmospheric / rain loss: horizontal sea-level path with",
+        "    uniform attenuation (pessimistic for elevated paths).",
+    ]
+    if table_dir:
+        out += ["", f"Tables folder: {table_dir}"]
+    return "\n".join(out)
+
+
+# =================================================================
+# MATCHED FILTER SIMULATION (numpy)
+# =================================================================
+
+BARKER = {
+    2: [1, -1], 3: [1, 1, -1], 4: [1, 1, -1, 1], 5: [1, 1, 1, -1, 1],
+    7: [1, 1, 1, -1, -1, 1, -1],
+    11: [1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1],
+    13: [1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1],
+}
+
+
+def tx_pulse(pw_s, mop, mop_param, b_sig, fs):
+    """Complex baseband transmitted pulse. Returns (t, samples, description)."""
+    n = max(2, int(round(pw_s * fs)))
+    t = (np.arange(n) + 0.5) / fs
+    if mop == "LFM" and b_sig * pw_s > 1 + 1e-9:
+        k = b_sig / pw_s                                   # chirp rate
+        s = np.exp(1j * np.pi * k * (t - pw_s / 2) ** 2)
+        desc = f"LFM chirp, {b_sig/1e6:g} MHz"
+    elif mop == "Phase code" and mop_param and round(mop_param) > 1:
+        nc = int(round(mop_param))
+        code = BARKER.get(nc)
+        if code is None:
+            raise ValueError(
+                f"The {nc}-chip code sequence is not defined. Only the chip "
+                "count is an input, so the plot can only use Barker codes "
+                f"(N = {', '.join(str(k) for k in sorted(BARKER))}).")
+        desc = f"Barker-{nc} phase code"
+        chip = np.minimum((t / pw_s * nc).astype(int), nc - 1)
+        s = np.asarray(code, dtype=float)[chip].astype(complex)
+    else:
+        s = np.ones(n, dtype=complex)
+        desc = "Rectangular pulse (no MOP)"
+    return t, s, desc
+
+
+def simulate_mf(res, integrated=False, seed=1, max_samples=2 ** 17):
+    """
+    Simulate receiver input and matched filter output around the target.
+
+    Chain: pulse (delayed to target range) + complex white noise
+           -> front-end brick-wall filter |f| <= B_rx/2
+           -> matched filter: correlation with the transmitted pulse
+              band-limited to the same B_rx (MF bandwidth = receiver BW)
+    The amplitude is calibrated so that the noise-free matched filter
+    peak / mean output noise power = SNR from the radar equation.
+    Integrated mode: the coherent sum of N pulses with independent
+    Gaussian noise is statistically one realisation at SNR x N.
+    """
+    pw_s = res["pw_us"] * 1e-6
+    b_sig, b_rx = res["b_sig"], res["b_rx"]
+    b_max, b_eff = max(b_sig, b_rx), min(b_sig, b_rx)
+    notes = []
+
+    fs = max(8 * b_max, 64 / pw_s)              # oversampled
+    t_win = 4 * pw_s + 40 / b_eff                # observation window
+    if t_win * fs > max_samples:
+        fs = max(2.5 * b_max, max_samples / t_win)
+    L = int(round(t_win * fs))
+    if L > max_samples:
+        L = max_samples
+        notes.append("window shortened to limit samples")
+
+    t_p, pulse, desc = tx_pulse(pw_s, res["mop"], res["mop_param"], b_sig, fs)
+    n_p = len(pulse)
+    L = max(L, 2 * n_p)
+
+    freqs = np.fft.fftfreq(L, 1 / fs)
+    h_rx = (np.abs(freqs) <= b_rx / 2).astype(float)   # receiver BW
+    rep_pad = np.zeros(L, dtype=complex)
+    rep_pad[:n_p] = pulse
+    h_mf = np.conj(np.fft.fft(rep_pad) * h_rx)          # MF, same BW
+    h_tot = h_rx * h_mf                                 # front end x MF
+
+    i0 = L // 2 - n_p // 2                       # pulse start index
+    sig = np.zeros(L, dtype=complex)
+    sig[i0:i0 + n_p] = pulse
+    S = np.fft.fft(sig)
+    s_in = np.fft.ifft(S * h_rx)                 # signal at MF input
+    y_s = np.fft.ifft(S * h_tot)                 # signal at MF output
+
+    rng = np.random.default_rng(seed)
+    noise = (rng.standard_normal(L) + 1j * rng.standard_normal(L)) / np.sqrt(2)
+    N = np.fft.fft(noise)
+    n_in = np.fft.ifft(N * h_rx)
+    y_n = np.fft.ifft(N * h_tot)
+
+    pn_in = np.mean(h_rx ** 2)                   # expected noise powers
+    pn_out = np.mean(np.abs(h_tot) ** 2)
+
+    snr_db = res["snr_int_tgt_db"] if integrated else res["snr1_tgt_db"]
+    thr_db = res["snr_req_db"] if integrated else res["snr1_req_db"]
+    ps = np.max(np.abs(y_s) ** 2)
+    amp = np.sqrt(10 ** (snr_db / 10) * pn_out / ps)
+
+    def db(x):
+        return 10 * np.log10(np.maximum(x, 1e-12))
+
+    in_clean = db(np.abs(amp * s_in) ** 2 / pn_in)
+    in_total = db(np.abs(amp * s_in + n_in) ** 2 / pn_in)
+    out_clean = db(np.abs(amp * y_s) ** 2 / pn_out)
+    out_total = db(np.abs(amp * y_s + y_n) ** 2 / pn_out)
+
+    delay = 2 * res["target_km"] * 1000.0 / C
+    t0 = delay - i0 / fs
+    range_km = C * (t0 + np.arange(L) / fs) / 2 / 1000.0
+
+    # measured output peak near the target
+    half = max(3, int(round(2 * fs / b_eff)))
+    lo, hi = max(0, i0 - half), min(L, i0 + half)
+    measured_peak = float(np.max(out_total[lo:hi]))
+
+    zoom_km = min(25 * C / (2 * b_eff), C * pw_s / 2 * 2) / 1000.0
+    zoom_km = min(zoom_km, (range_km[-1] - range_km[0]) / 2)
+
+    return {
+        "desc": desc, "fs": fs, "notes": notes,
+        "zoom_km": zoom_km,
+        "t_pulse_us": t_p * 1e6, "pulse": pulse,
+        "range_km": range_km,
+        "in_clean": in_clean, "in_total": in_total,
+        "out_clean": out_clean, "out_total": out_total,
+        "snr_db": snr_db, "thr_db": thr_db,
+        "input_peak_snr_db": float(np.max(in_clean)),
+        "measured_peak_db": measured_peak,
+        "integrated": integrated,
+    }
+
+
+def draw_mf(fig, res, sim):
+    """Draw pulse, MF input and MF output into a matplotlib figure."""
+    fig.clear()
+    ax1, ax2, ax3 = fig.subplots(3, 1, gridspec_kw={"height_ratios": [1, 1.3, 1.6]})
+    c_noise, c_sig = "#4a90c2", "#e67e22"
+
+    # 1) transmitted pulse
+    ax1.plot(sim["t_pulse_us"], sim["pulse"].real, color="#4a90c2",
+             lw=0.8, label="I (real part)")
+    ax1.plot(sim["t_pulse_us"], np.abs(sim["pulse"]), color="black",
+             lw=1.2, label="envelope")
+    ax1.set_title(f"Transmitted pulse: {sim['desc']}, "
+                  f"PW = {res['pw_us']:g} us", fontsize=9)
+    ax1.set_xlabel("time (us)", fontsize=8)
+    ax1.set_ylim(-1.3, 1.3)
+    ax1.legend(loc="upper right", fontsize=7)
+
+    x = sim["range_km"]
+    floor_kw = dict(color="gray", ls="--", lw=1.2)
+
+    # 2) matched filter input
+    ax2.plot(x, sim["in_total"], color=c_noise, lw=0.6, alpha=0.8,
+             label="signal + noise")
+    ax2.plot(x, sim["in_clean"], color=c_sig, lw=1.5, label="signal only",
+             zorder=3)
+    ax2.axhline(0, label="noise floor (mean power)", **floor_kw)
+    ax2.set_title(f"Matched filter INPUT (after {res['b_rx']/1e6:g} MHz "
+                  f"front end)\npeak SNR {sim['input_peak_snr_db']:.1f} dB",
+                  fontsize=9)
+
+    # 3) matched filter output
+    ax3.plot(x, sim["out_total"], color=c_noise, lw=0.6, alpha=0.8,
+             label="signal + noise")
+    ax3.plot(x, sim["out_clean"], color=c_sig, lw=1.5, label="signal only",
+             zorder=3)
+    ax3.axhline(0, label="noise floor (mean power)", **floor_kw)
+    ax3.axhline(sim["thr_db"], color="#c0392b", ls="--", lw=1.2,
+                label=f"required SNR ({sim['thr_db']:.1f} dB)")
+    lim_note = (f", limiting PRI {res['pri_list'][res['lim']]:g} us"
+                if res["pri_mode"] == "switch" else "")
+    mode = (f"after coherent integration (N = {res['n']}{lim_note})"
+            if sim["integrated"] else "single pulse")
+    ax3.set_title(f"Matched filter OUTPUT (MF BW = {res['b_rx']/1e6:g} MHz),"
+                  f" {mode}\n"
+                  f"peak SNR {sim['snr_db']:.1f} dB (theory), "
+                  f"{sim['measured_peak_db']:.1f} dB (this noise sample), "
+                  f"zoom +/-{sim['zoom_km']*1000:.0f} m", fontsize=9)
+    ax3.set_xlabel("range (km)", fontsize=8)
+    ax3.set_xlim(res["target_km"] - sim["zoom_km"],
+                 res["target_km"] + sim["zoom_km"])
+
+    for ax in (ax2, ax3):
+        ax.set_ylabel("power re noise (dB)", fontsize=8)
+        ax.axvline(res["target_km"], color="green", lw=0.8, alpha=0.6)
+        top = max(10.0, np.max(ax.lines[1].get_ydata()) + 6)
+        ax.set_ylim(-30, top)
+        ax.legend(loc="upper right", fontsize=7)
+    ax3.set_ylim(-30, max(ax3.get_ylim()[1], sim["thr_db"] + 6))
+    for ax in (ax1, ax2, ax3):
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.25)
+    fig.tight_layout()
+
+
+# =================================================================
+# 2D GEOMETRY VIEW (numpy)
+# =================================================================
+
+ANT_SPAN_DB = 40.0       # dynamic range of the antenna lobe drawing
+RCS_SPAN_DB = 30.0       # dynamic range of the RCS lobe drawing
+_GEO_CACHE = {}
+
+
+def _cache_put(key, value):
+    if len(_GEO_CACHE) > 24:
+        _GEO_CACHE.clear()
+    _GEO_CACHE[key] = value
+
+
+def off_boresight_np(az, el, ant_az, ant_el):
+    """Vectorised off_boresight(). Returns (az_off, el_off) in degrees."""
+    a, e = np.radians(az), np.radians(el)
+    pa, pe = math.radians(ant_az), math.radians(ant_el)
+    vx = np.cos(e) * np.cos(a)
+    vy = np.cos(e) * np.sin(a)
+    vz = np.sin(e) + 0 * a
+    x1 = vx * math.cos(pa) + vy * math.sin(pa)
+    y1 = -vx * math.sin(pa) + vy * math.cos(pa)
+    x2 = x1 * math.cos(pe) + vz * math.sin(pe)
+    z2 = -x1 * math.sin(pe) + vz * math.cos(pe)
+    return (np.degrees(np.arctan2(y1, x2)),
+            np.degrees(np.arctan2(z2, np.hypot(x2, y1))))
+
+
+def antenna_cuts(tables, freq_ghz, step=0.25):
+    """Principal-plane cuts on a fine grid, cached per table and frequency.
+    Returns (angles, az_cut, el_cut, peak)."""
+    tbl = tables["antenna_gain"]
+    key = ("gain", round(freq_ghz, 6))
+    hit = _GEO_CACHE.get(key)
+    if hit is None or hit[0] is not tbl:
+        angles = np.arange(0.0, 180.0 + step, step)
+        azc = np.array([grid_value(tbl, freq_ghz, a, 0)[0] for a in angles])
+        elc = np.array([grid_value(tbl, freq_ghz, a, 1)[0] for a in angles])
+        hit = (tbl, angles, azc, elc, max(azc[0], elc[0]))
+        _cache_put(key, hit)
+    return hit[1:]
+
+
+def gain_map(tables, freq_ghz, az_off, el_off):
+    """Vectorised antenna_gain(): az cut + el cut - peak. Returns (dBi, peak)."""
+    angles, azc, elc, peak = antenna_cuts(tables, freq_ghz)
+    g = (np.interp(np.abs(az_off), angles, azc)
+         + np.interp(np.abs(el_off), angles, elc) - peak)
+    return np.maximum(g, peak - 60.0), peak
+
+
+def rcs_curve(tables, freq_ghz, pol, step=0.5):
+    """RCS (dBsm) vs aspect 0..180 deg, cached. Returns (angles, dBsm)."""
+    tbl = tables["rcs"]
+    key = ("rcs", round(freq_ghz, 6), pol)
+    hit = _GEO_CACHE.get(key)
+    if hit is None or hit[0] is not tbl:
+        angles = np.arange(0.0, 180.0 + step, step)
+        vals = np.array([10 * math.log10(rcs_value(tables, freq_ghz, a, pol)[0])
+                         for a in angles])
+        hit = (tbl, angles, vals)
+        _cache_put(key, hit)
+    return hit[1], hit[2]
+
+
+class GeometryView:
+    """Four live-updating 2D plots. Artists are created once; update() only
+    changes their data, so dragging a slider stays smooth."""
+
+    BLUE, GREEN, ORANGE, GRAY = "#2e86c1", "#27ae60", "#d35400", "#7f8c8d"
+
+    def __init__(self, fig):
+        self.fig = fig
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.3, 1], hspace=0.42,
+                              wspace=0.30, left=0.09, right=0.97,
+                              top=0.91, bottom=0.08)
+        self.ax_plan = fig.add_subplot(gs[0, 0])
+        self.ax_side = fig.add_subplot(gs[0, 1])
+        self.ax_gain = fig.add_subplot(gs[1, 0])
+        self.ax_rcs = fig.add_subplot(gs[1, 1])
+        self.status = fig.text(0.5, 0.975, "", ha="center", va="center",
+                               fontsize=9, fontweight="bold")
+        self.last = {}
+        self._build_plan()
+        self._build_side()
+        self._build_gain()
+        self._build_rcs()
+
+    # ---------------- construction ----------------
+    def _style(self, ax, title, xlabel, ylabel):
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel(xlabel, fontsize=7)
+        ax.set_ylabel(ylabel, fontsize=7)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.25)
+
+    def _build_plan(self):
+        ax = self.ax_plan
+        self._style(ax, "Plan view (top-down, north up)", "East (km)",
+                    "North (km)")
+        ax.set_aspect("equal", adjustable="box")
+        self.p_lobe = ax.fill([0], [0], color=self.BLUE, alpha=0.25, lw=0)[0]
+        self.p_lobe_ln, = ax.plot([], [], color=self.BLUE, lw=1.2)
+        self.p_bore, = ax.plot([], [], color=self.BLUE, ls="--", lw=1)
+        self.p_los, = ax.plot([], [], color=self.GRAY, ls=":", lw=1)
+        self.p_rcs = ax.fill([0], [0], color=self.ORANGE, alpha=0.25, lw=0)[0]
+        self.p_rcs_ln, = ax.plot([], [], color=self.ORANGE, lw=1.2)
+        self.p_rcs_pt, = ax.plot([], [], "o", color=self.ORANGE, mfc="white",
+                                 ms=5, zorder=5)
+        self.p_tgt, = ax.plot([], [], "D", color=self.ORANGE, ms=6, zorder=6)
+        ax.plot([0], [0], "^", color="black", ms=8, zorder=6)
+        ax.annotate("Radar", (0, 0), xytext=(6, -12), textcoords="offset points",
+                    fontsize=7)
+        self.p_head = ax.annotate(
+            "", xy=(0, 0), xytext=(0, 0),
+            arrowprops=dict(arrowstyle="-|>", color=self.ORANGE, lw=1.5),
+            zorder=6)
+        self.p_info = ax.text(
+            0.02, 0.02, "", transform=ax.transAxes, fontsize=6.5, va="bottom",
+            bbox=dict(boxstyle="round", fc="white", ec="#cccccc", alpha=0.85))
+        from matplotlib.patches import Patch
+        ax.legend(handles=[
+            Patch(color=self.BLUE, alpha=0.4, label="antenna gain pattern"),
+            Patch(color=self.ORANGE, alpha=0.4, label="target RCS pattern"),
+        ], loc="upper right", fontsize=6.5)
+
+    def _build_side(self):
+        ax = self.ax_side
+        self._style(ax, "Side view (vertical plane through target)",
+                    "Range along target azimuth (km)", "Height (km)")
+        ax.set_aspect("equal", adjustable="box")
+        ax.axhspan(-1e6, 0, color="#f2f3f4", zorder=0)
+        ax.axhline(0, color="#999999", lw=0.8, zorder=1)
+        self.s_lobe = ax.fill([0], [0], color=self.BLUE, alpha=0.25, lw=0)[0]
+        self.s_lobe_ln, = ax.plot([], [], color=self.BLUE, lw=1.2)
+        self.s_bore, = ax.plot([], [], color=self.BLUE, ls="--", lw=1)
+        self.s_los, = ax.plot([], [], color=self.GRAY, ls=":", lw=1)
+        self.s_tgt, = ax.plot([], [], "D", color=self.ORANGE, ms=6, zorder=6)
+        ax.plot([0], [0], "^", color="black", ms=8, zorder=6)
+        self.s_info = ax.text(
+            0.02, 0.97, "", transform=ax.transAxes, fontsize=6.5, va="top",
+            bbox=dict(boxstyle="round", fc="white", ec="#cccccc", alpha=0.85))
+
+    def _build_gain(self):
+        ax = self.ax_gain
+        self._style(ax, "Antenna gain cuts", "off-boresight angle (deg)",
+                    "gain (dBi)")
+        self.g_az, = ax.plot([], [], color=self.BLUE, lw=1.4, label="azimuth cut")
+        self.g_el, = ax.plot([], [], color=self.GREEN, lw=1.4, label="elevation cut")
+        self.g_pt_az, = ax.plot([], [], "o", color=self.BLUE, mfc="white",
+                                ms=6, zorder=5, clip_on=False)
+        self.g_pt_el, = ax.plot([], [], "o", color=self.GREEN, mfc="white",
+                                ms=6, zorder=5, clip_on=False)
+        self.g_txt = ax.text(0.97, 0.05, "", transform=ax.transAxes,
+                             fontsize=7, ha="right", va="bottom",
+                             bbox=dict(boxstyle="round", fc="white",
+                                       ec="#cccccc", alpha=0.85))
+        self.g_leg = ax.legend(loc="upper right", fontsize=6.5)
+
+    def _build_rcs(self):
+        ax = self.ax_rcs
+        self._style(ax, "Target RCS vs aspect", "aspect angle (deg)  "
+                    "0 = nose-on, 180 = tail-on", "RCS (dBsm)")
+        self.r_ln, = ax.plot([], [], color=self.ORANGE, lw=1.4)
+        self.r_pt, = ax.plot([], [], "o", color=self.ORANGE, mfc="white",
+                             ms=6, zorder=5, clip_on=False)
+        self.r_txt = ax.text(0.97, 0.05, "", transform=ax.transAxes,
+                             fontsize=7, ha="right", va="bottom",
+                             bbox=dict(boxstyle="round", fc="white",
+                                       ec="#cccccc", alpha=0.85))
+        ax.set_xlim(-4, 184)
+
+    # ---------------- live update ----------------
+    @staticmethod
+    def _poly(artist, xs, ys):
+        artist.set_xy(np.column_stack([xs, ys]))
+
+    def update(self, res, tables):
+        f = res["freq_ghz"]
+        R = res["target_km"]
+        el = res["tgt_el"]
+        az_t = res["tgt_az"]
+        ant_az, ant_el = res["ant_az"], res["ant_el"]
+        has_pat = res["gain_source"].startswith("table")
+        rcs_tab = res["rcs_source"].startswith("table")
+        ground = R * math.cos(math.radians(el))
+        height = R * math.sin(math.radians(el))
+        sig_db = 10 * math.log10(res["rcs_m2"])
+
+        self.status.set_text(
+            f"{res['status_text']}\nmargin {res['margin_db']:+.2f} dB at "
+            f"{R:,.2f} km")
+        self.status.set_color(STATUS_COLOR[res["status_kind"]])
+
+        info_ant = (f"Antenna az {ant_az:.1f}, el {ant_el:.1f} deg\n"
+                    f"gain toward target {res['gain_dbi']:.1f} dBi "
+                    f"(peak {res['gain_peak_dbi']:.1f})\n"
+                    f"off-boresight {res['tot_off']:.1f} deg")
+        info_tgt = (f"Target R {R:.1f} km, az {az_t:.1f}, el {el:.1f} deg\n"
+                    f"heading {res['tgt_heading']:.0f} deg, "
+                    f"speed {res['speed_ms']:g} m/s\n"
+                    f"aspect {res['aspect']:.0f} deg, "
+                    f"radial {res['radial_ms']:+.1f} m/s\n"
+                    f"RCS {res['rcs_m2']:.3g} m2 ({sig_db:.1f} dBsm)")
+
+        # ================= plan view =================
+        Rp = max(ground, 0.1 * R)
+        phi = np.arange(0.0, 361.0, 1.0)                # compass azimuth
+        sin_p, cos_p = np.sin(np.radians(phi)), np.cos(np.radians(phi))
+        sin_t = math.sin(math.radians(az_t))
+        cos_t = math.cos(math.radians(az_t))
+        xt, yt = ground * sin_t, ground * cos_t
+
+        for art in (self.p_lobe, self.p_lobe_ln):
+            art.set_visible(has_pat)
+        if has_pat:
+            a_off, e_off = off_boresight_np(phi, el, ant_az, ant_el)
+            g, peak = gain_map(tables, f, a_off, e_off)
+            rad = 0.9 * Rp * np.clip((g - (peak - ANT_SPAN_DB)) / ANT_SPAN_DB,
+                                     0.0, 1.0)
+            self._poly(self.p_lobe, rad * sin_p, rad * cos_p)
+            self.p_lobe_ln.set_data(rad * sin_p, rad * cos_p)
+            self.last["plan_gain"] = (phi, g)
+        sa, ca = (math.sin(math.radians(ant_az)),
+                  math.cos(math.radians(ant_az)))
+        self.p_bore.set_data([0, 0.9 * Rp * sa], [0, 0.9 * Rp * ca])
+        self.p_los.set_data([0, xt], [0, yt])
+        self.p_tgt.set_data([xt], [yt])
+
+        Rt = 0.22 * Rp
+        asp = np.abs((res["tgt_heading"] - phi + 180.0) % 360.0 - 180.0)
+        if rcs_tab:
+            ang, vals = rcs_curve(tables, f, res["pol"])
+            vmax = float(vals.max())
+            sc = lambda v: Rt * np.clip((v - (vmax - RCS_SPAN_DB))
+                                        / RCS_SPAN_DB, 0.05, 1.0)
+            rr = sc(np.interp(asp, ang, vals))
+            r_now = float(sc(sig_db))
+            self.last["plan_rcs"] = (phi, np.interp(asp, ang, vals))
+        else:
+            rr = np.full_like(phi, 0.6 * Rt)
+            r_now = 0.6 * Rt
+        self._poly(self.p_rcs, xt + rr * sin_p, yt + rr * cos_p)
+        self.p_rcs_ln.set_data(xt + rr * sin_p, yt + rr * cos_p)
+        # point of the lobe that the radar sees (bearing target -> radar)
+        self.p_rcs_pt.set_data([xt - r_now * sin_t], [yt - r_now * cos_t])
+        hd = math.radians(res["tgt_heading"])
+        self.p_head.xy = (xt + 0.32 * Rp * math.sin(hd),
+                          yt + 0.32 * Rp * math.cos(hd))
+        self.p_head.set_position((xt, yt))
+        self.ax_plan.set_xlim(-1.45 * Rp, 1.45 * Rp)
+        self.ax_plan.set_ylim(-1.45 * Rp, 1.45 * Rp)
+        self.p_info.set_text(info_ant + "\n" + info_tgt)
+
+        # ================= side view =================
+        psi = np.arange(0.0, 361.0, 1.0)         # angle in the vertical plane
+        pw = (psi + 180.0) % 360.0 - 180.0
+        front = np.abs(pw) <= 90.0
+        el_dir = np.where(front, pw, np.sign(pw) * (180.0 - np.abs(pw)))
+        az_dir = np.where(front, az_t, az_t + 180.0)
+        for art in (self.s_lobe, self.s_lobe_ln, self.s_bore):
+            art.set_visible(has_pat)
+        if has_pat:
+            a_off, e_off = off_boresight_np(az_dir, el_dir, ant_az, ant_el)
+            g, peak = gain_map(tables, f, a_off, e_off)
+            rad = 0.9 * R * np.clip((g - (peak - ANT_SPAN_DB)) / ANT_SPAN_DB,
+                                    0.0, 1.0)
+            cx, cy = np.cos(np.radians(psi)), np.sin(np.radians(psi))
+            self._poly(self.s_lobe, rad * cx, rad * cy)
+            self.s_lobe_ln.set_data(rad * cx, rad * cy)
+            k = int(np.argmax(g))
+            self.s_bore.set_data([0, 0.9 * R * cx[k]], [0, 0.9 * R * cy[k]])
+            self.last["side_gain"] = (psi, g)
+        self.s_los.set_data([0, ground], [0, height])
+        self.s_tgt.set_data([ground], [height])
+        ymax = max(0.6 * R, 1.15 * height)
+        ymin = min(-0.4 * R, 1.15 * height)
+        self.ax_side.set_xlim(-0.5 * R, max(1.15 * R, 1.15 * ground))
+        self.ax_side.set_ylim(ymin, ymax)
+        self.s_info.set_text(
+            f"target: ground {ground:.1f} km, height {height:.2f} km\n"
+            f"lobe = gain in the vertical plane at az {az_t:.1f} deg\n"
+            f"dashed blue = beam maximum in this plane")
+
+        # ================= gain cuts =================
+        ax = self.ax_gain
+        for art in (self.g_az, self.g_el, self.g_pt_az, self.g_pt_el,
+                    self.g_leg):
+            art.set_visible(has_pat)
+        if has_pat:
+            angles, azc, elc, peak = antenna_cuts(tables, f)
+            xmax = min(180.0, max(12.0, 1.6 * max(abs(res["az_off"]),
+                                                  abs(res["el_off"])) + 3.0))
+            self.g_az.set_data(angles, azc)
+            self.g_el.set_data(angles, elc)
+            self.g_pt_az.set_data([abs(res["az_off"])],
+                                  [np.interp(abs(res["az_off"]), angles, azc)])
+            self.g_pt_el.set_data([abs(res["el_off"])],
+                                  [np.interp(abs(res["el_off"]), angles, elc)])
+            ax.set_xlim(-0.03 * xmax, xmax)
+            ax.set_ylim(peak - 45, peak + 4)
+            self.g_txt.set_text(
+                f"toward target: az off {abs(res['az_off']):.1f}, "
+                f"el off {abs(res['el_off']):.1f} deg\n"
+                f"G = az cut + el cut - peak = {res['gain_dbi']:.1f} dBi")
+        else:
+            ax.set_xlim(0, 12)
+            ax.set_ylim(res["gain_dbi"] - 10, res["gain_dbi"] + 5)
+            self.g_txt.set_text(f"manual gain {res['gain_dbi']:.1f} dBi "
+                                "(constant)\nno pattern: pointing has no effect")
+
+        # ================= RCS vs aspect =================
+        ax = self.ax_rcs
+        if rcs_tab:
+            ang, vals = rcs_curve(tables, f, res["pol"])
+            self.r_ln.set_data(ang, vals)
+            self.r_ln.set_linestyle("-")
+            ax.set_ylim(float(vals.min()) - 3, float(vals.max()) + 3)
+        else:
+            self.r_ln.set_data([0, 180], [sig_db, sig_db])
+            self.r_ln.set_linestyle("--")
+            ax.set_ylim(sig_db - 10, sig_db + 10)
+        self.r_pt.set_data([res["aspect"]], [sig_db])
+        self.r_txt.set_text(
+            f"aspect {res['aspect']:.1f} deg, pol {res['pol']}\n"
+            f"RCS {res['rcs_m2']:.3g} m2 = {sig_db:.1f} dBsm"
+            + ("" if rcs_tab else "\nmanual (constant)"))
+
+        self.fig.canvas.draw_idle()
+
+
+# =================================================================
+# GUI
+# =================================================================
+
+def make_scrollable(parent):
+    """Vertical scrollable frame (for the input column)."""
+    outer = ttk.Frame(parent)
+    canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+    vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vsb.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+
+    inner = ttk.Frame(canvas)
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+
+    def on_configure(_):
+        canvas.configure(scrollregion=canvas.bbox("all"),
+                         width=inner.winfo_reqwidth())
+
+    inner.bind("<Configure>", on_configure)
+
+    def on_wheel(event):
+        if event.num == 4:
+            canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            canvas.yview_scroll(1, "units")
+        else:
+            canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def bind_wheel(_):
+        canvas.bind_all("<MouseWheel>", on_wheel)
+        canvas.bind_all("<Button-4>", on_wheel)
+        canvas.bind_all("<Button-5>", on_wheel)
+
+    def unbind_wheel(_):
+        canvas.unbind_all("<MouseWheel>")
+        canvas.unbind_all("<Button-4>")
+        canvas.unbind_all("<Button-5>")
+
+    canvas.bind("<Enter>", bind_wheel)
+    canvas.bind("<Leave>", unbind_wheel)
+    return outer, inner
+
+
+def build_gui():
+    table_dir = default_table_dir()
+    state = {"tables": None, "table_msgs": [], "suppress": False,
+             "pending": None, "sync": False}
+    state["tables"], state["table_msgs"] = load_tables(table_dir)
+
+    root = tk.Tk()
+    root.title("Radar Detection Range Calculator")
+    root.geometry("1500x900")
+    root.minsize(1050, 600)
+
+    main = ttk.Frame(root, padding=14)
+    main.pack(fill="both", expand=True)
+    main.columnconfigure(1, weight=1)
+    main.rowconfigure(0, weight=1)
+
+    left_outer, left = make_scrollable(main)
+    left_outer.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+
+    def section(title, row):
+        frame = ttk.LabelFrame(left, text=title, padding=10)
+        frame.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else 10, 0))
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    radar_f = section("Radar", 0)
+    ant_f = section("Antenna", 1)
+    tgt_f = section("Target", 2)
+    loss_f = section("Losses ('table' = read from frequency table)", 3)
+
+    notebook = ttk.Notebook(main)
+    notebook.grid(row=0, column=1, rowspan=2, sticky="nsew")
+    out = ttk.Frame(notebook, padding=8)
+    mf_tab = ttk.Frame(notebook, padding=8)
+    notebook.add(out, text="Results")
+    notebook.add(mf_tab, text="Matched filter")
+    geo_tab = ttk.Frame(notebook, padding=8)
+    notebook.add(geo_tab, text="Geometry (2D)")
+    geo_tab.columnconfigure(0, weight=1)
+    geo_tab.rowconfigure(0, weight=1)
+
+    def tab_is(frame):
+        return notebook.select() == str(frame)
+    out.columnconfigure(0, weight=1)
+    out.rowconfigure(0, weight=1)
+    mf_tab.columnconfigure(0, weight=1)
+    mf_tab.rowconfigure(1, weight=1)
+
+    mf = {"fig": None, "canvas": None, "res": None, "seed": 1}
+    mf_mode = tk.StringVar(value="single")
+
+    def redraw_mf(*_):
+        if mf["fig"] is None or mf["res"] is None:
+            return
+        if not tab_is(mf_tab):
+            return                     # draw only when the tab is visible
+        try:
+            sim = simulate_mf(mf["res"],
+                              integrated=mf_mode.get() == "integrated",
+                              seed=mf["seed"])
+            draw_mf(mf["fig"], mf["res"], sim)
+        except ValueError as exc:
+            mf["fig"].clear()
+            msg = "\n".join(textwrap.wrap(str(exc), 60))
+            mf["fig"].text(0.05, 0.9,
+                           f"Matched filter view not available:\n\n{msg}",
+                           va="top", fontsize=10)
+        mf["canvas"].draw_idle()
+
+    def new_noise():
+        mf["seed"] += 1
+        redraw_mf()
+
+    if HAVE_PLOT:
+        ctrl = ttk.Frame(mf_tab)
+        ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Radiobutton(ctrl, text="Single pulse", value="single",
+                        variable=mf_mode, command=redraw_mf).pack(side="left")
+        ttk.Radiobutton(ctrl, text="Coherent integration (N pulses)",
+                        value="integrated", variable=mf_mode,
+                        command=redraw_mf).pack(side="left", padx=(10, 0))
+        ttk.Button(ctrl, text="New noise", command=new_noise).pack(
+            side="left", padx=(16, 0))
+        mf["fig"] = Figure(figsize=(7, 7), dpi=100)
+        mf["canvas"] = FigureCanvasTkAgg(mf["fig"], master=mf_tab)
+        mf["canvas"].get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        bar = ttk.Frame(mf_tab)
+        bar.grid(row=2, column=0, sticky="ew")
+        NavigationToolbar2Tk(mf["canvas"], bar)
+    else:
+        ttk.Label(
+            mf_tab, justify="left",
+            text="The matched filter view needs numpy and matplotlib:\n\n"
+                 "    pip install numpy matplotlib\n\n"
+                 "Then restart the program.").grid(row=0, column=0, sticky="nw")
+
+    # ---- 2D geometry tab ----
+    geo = {"view": None, "res": None}
+
+    def redraw_geo(*_):
+        if geo["view"] is None or geo["res"] is None or not tab_is(geo_tab):
+            return
+        try:
+            geo["view"].update(geo["res"], state["tables"])
+        except (ValueError, KeyError) as exc:
+            geo["view"].status.set_text(f"Geometry view error: {exc}")
+            geo["view"].status.set_color("#c0392b")
+            geo["view"].fig.canvas.draw_idle()
+
+    if HAVE_PLOT:
+        geo_fig = Figure(figsize=(8, 7.5), dpi=100)
+        geo_canvas = FigureCanvasTkAgg(geo_fig, master=geo_tab)
+        geo_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        geo_bar = ttk.Frame(geo_tab)
+        geo_bar.grid(row=1, column=0, sticky="ew")
+        NavigationToolbar2Tk(geo_canvas, geo_bar)
+        geo["view"] = GeometryView(geo_fig)
+    else:
+        ttk.Label(
+            geo_tab, justify="left",
+            text="The 2D geometry view needs numpy and matplotlib:\n\n"
+                 "    pip install numpy matplotlib\n\n"
+                 "Then restart the program.").grid(row=0, column=0, sticky="nw")
+
+    def on_tab_changed(_event=None):
+        redraw_mf()
+        redraw_geo()
+
+    notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
+    text = tk.Text(out, font=("Consolas", 10), wrap="word",
+                   relief="flat", padx=8, pady=8, state="disabled")
+    scroll = ttk.Scrollbar(out, orient="vertical", command=text.yview)
+    text.configure(yscrollcommand=scroll.set)
+    text.grid(row=0, column=0, sticky="nsew")
+    scroll.grid(row=0, column=1, sticky="ns")
+    text.tag_configure("ok", foreground="#1a7f37", font=("Consolas", 11, "bold"))
+    text.tag_configure("bad", foreground="#c0392b", font=("Consolas", 11, "bold"))
+    text.tag_configure("warn", foreground="#b9770e", font=("Consolas", 11, "bold"))
+
+    vars_, labels, entries = {}, {}, {}
+    table_flags, table_checks = {}, {}
+    rows = {}
+
+    def add_entry(frame, key, label, default, typical=None, table_key=False):
+        r = rows.get(frame, 0)
+        lbl = ttk.Label(frame, text=label)
+        lbl.grid(row=r, column=0, sticky="w", pady=2)
+        var = tk.StringVar(value=default)
+        ent = ttk.Entry(frame, textvariable=var, width=10)
+        ent.grid(row=r, column=1, sticky="ew", pady=2, padx=(12, 0))
+        if table_key:
+            flag = tk.BooleanVar(value=False)
+            chk = ttk.Checkbutton(frame, text="table", variable=flag,
+                                  command=lambda k=key: on_table_toggle(k))
+            chk.grid(row=r, column=2, sticky="w", padx=(8, 0))
+            table_flags[key], table_checks[key] = flag, chk
+        if typical:
+            ttk.Label(frame, text=typical, foreground="gray45").grid(
+                row=r, column=3, sticky="w", padx=(8, 0))
+        vars_[key], labels[key], entries[key] = var, lbl, ent
+        rows[frame] = r + 1
+        return r
+
+    def add_combo(frame, label, values, default):
+        r = rows.get(frame, 0)
+        ttk.Label(frame, text=label).grid(row=r, column=0, sticky="w", pady=2)
+        var = tk.StringVar(value=default)
+        box = ttk.Combobox(frame, textvariable=var, values=values,
+                           state="readonly", width=10)
+        box.grid(row=r, column=1, sticky="ew", pady=2, padx=(12, 0))
+        rows[frame] = r + 1
+        return var, box
+
+    def add_readonly(frame, key, label):
+        """Read-only text row spanning the value and hint columns."""
+        r = rows.get(frame, 0)
+        lbl = ttk.Label(frame, text=label)
+        lbl.grid(row=r, column=0, sticky="w", pady=2)
+        var = tk.StringVar(value="")
+        ent = ttk.Entry(frame, textvariable=var, width=10)
+        ent.grid(row=r, column=1, columnspan=3, sticky="ew", pady=2,
+                 padx=(12, 0))
+        ent.state(["disabled"])
+        vars_[key], labels[key], entries[key] = var, lbl, ent
+        rows[frame] = r + 1
+
+    def add_slider(frame, key, row, lo, hi):
+        """Slider linked to an entry (two-way sync)."""
+        dv = tk.DoubleVar()
+        try:
+            dv.set(float(vars_[key].get()))
+        except ValueError:
+            dv.set(lo)
+        sc = ttk.Scale(frame, from_=lo, to=hi, variable=dv,
+                       orient="horizontal", length=190)
+        sc.grid(row=row, column=2, columnspan=2, sticky="ew", padx=(8, 0))
+
+        def from_scale(*_):
+            if state["sync"]:
+                return
+            state["sync"] = True
+            vars_[key].set(f"{dv.get():.1f}")
+            state["sync"] = False
+
+        def from_entry(*_):
+            if state["sync"]:
+                return
+            try:
+                v = float(vars_[key].get().replace(",", "."))
+            except ValueError:
+                return
+            if lo <= v <= hi:
+                state["sync"] = True
+                dv.set(v)
+                state["sync"] = False
+
+        dv.trace_add("write", from_scale)
+        vars_[key].trace_add("write", from_entry)
+
+    # ---- radar ----
+    add_entry(radar_f, "p_dbm", "Peak power (dBm)", "80")
+    pri_mode_var, pri_mode_box = add_combo(radar_f, "PRI mode", PRI_MODES,
+                                           "PRI Stable")
+    add_entry(radar_f, "pri", "PRI (us)", "100")
+    add_entry(radar_f, "prf", "PRF (Hz, auto = 1 / PRI)", "")
+    add_entry(radar_f, "pw", "Pulse width PW (us)", "1")
+    mop_var, mop_box = add_combo(radar_f, "Modulation on pulse (MOP)",
+                                 MOP_OPTIONS, "None")
+    add_entry(radar_f, "mop_param", "MOP parameter (n/a)", "")
+    bw_row = add_entry(radar_f, "bw", "Receiver bandwidth (MHz)", "1")
+    suggested = {"mhz": None}
+
+    def use_suggested():
+        if suggested["mhz"] is not None:
+            vars_["bw"].set(f"{suggested['mhz']:.6g}")
+
+    ttk.Button(radar_f, text="Use", width=5, command=use_suggested).grid(
+        row=bw_row, column=2, padx=(8, 0), sticky="w")
+    add_entry(radar_f, "freq", "Frequency (GHz)", "10")
+    add_entry(radar_f, "nf", "Noise figure (dB)", "3")
+    add_entry(radar_f, "snr", "Required SNR (dB)", "13")
+    add_entry(radar_f, "temp", "System temperature (K)", "290")
+    cpi_mode_var, cpi_mode_box = add_combo(radar_f, "CPI defined by",
+                                           CPI_MODES, "CPI time")
+    add_entry(radar_f, "cpi", "CPI (ms)", "10")
+    add_entry(radar_f, "npulse", "Pulses per CPI (N)", "100")
+    add_entry(radar_f, "fft", "FFT points (auto, 2^k >= N)", "")
+    entries["prf"].state(["disabled"])
+    entries["fft"].state(["disabled"])
+
+    # ---- antenna ----
+    add_entry(ant_f, "gain", "Gain toward target (dBi)", "30",
+              "manual = constant gain", table_key=True)
+    pol_var, pol_box = add_combo(ant_f, "Polarisation", POL_OPTIONS, "H")
+    r_az = add_entry(ant_f, "ant_az", "Pointing azimuth (deg)", "30")
+    add_slider(ant_f, "ant_az", r_az, 0, 360)
+    r_el = add_entry(ant_f, "ant_el", "Pointing elevation (deg)", "2")
+    add_slider(ant_f, "ant_el", r_el, -10, 90)
+
+    def point_at_target():
+        vars_["ant_az"].set(vars_["tgt_az"].get())
+        vars_["ant_el"].set(vars_["tgt_el"].get())
+
+    ttk.Button(ant_f, text="Point antenna at target",
+               command=point_at_target).grid(
+        row=rows[ant_f], column=0, columnspan=4, sticky="ew", pady=(6, 0))
+    rows[ant_f] += 1
+
+    # ---- target ----
+    add_entry(tgt_f, "rcs", "RCS (m^2)", "1", "from aspect + pol",
+              table_key=True)
+    r_rng = add_entry(tgt_f, "tgt_range", "Range (km)", "30")
+    add_slider(tgt_f, "tgt_range", r_rng, 0.1, 200)
+    r_taz = add_entry(tgt_f, "tgt_az", "Azimuth (deg)", "30")
+    add_slider(tgt_f, "tgt_az", r_taz, 0, 360)
+    r_tel = add_entry(tgt_f, "tgt_el", "Elevation (deg)", "2")
+    add_slider(tgt_f, "tgt_el", r_tel, -10, 90)
+    add_entry(tgt_f, "tgt_heading", "Heading (deg)", "210",
+              "tgt az + 180 = nose-on")
+    add_entry(tgt_f, "tgt_speed", "Speed (m/s)", "200", "along heading")
+    r0 = rows[tgt_f]
+    ttk.Label(tgt_f, text="What the radar finds (read-only)",
+              foreground="gray45").grid(row=r0, column=0, columnspan=4,
+                                        sticky="w", pady=(8, 0))
+    rows[tgt_f] = r0 + 1
+    measure_keys = (("m_radial", "radial", "Radial velocity"),
+                    ("m_angrate", "angrate", "LOS angular rate"),
+                    ("m_dop_true", "dop_true", "Doppler, true"),
+                    ("m_range", "range_found", "Range found"),
+                    ("m_dop", "dop_found", "Doppler found"),
+                    ("m_ru", "ru", "Unambiguous range"),
+                    ("m_dopu", "dop_unamb", "Unambiguous Doppler"))
+    for key, _t, label in measure_keys:
+        add_readonly(tgt_f, key, label)
+
+    # ---- losses ----
+    for key, label, default, typical, _scope in LOSS_FIELDS:
+        add_entry(loss_f, key, label, default, f"typ. {typical}",
+                  table_key=True)
+    a_key, a_label, a_default, a_typ = ATMOS_FIELD
+    add_entry(loss_f, a_key, a_label, a_default, f"typ. {a_typ}",
+              table_key=True)
+    for key, label, default, typical in RAIN_FIELDS:
+        add_entry(loss_f, key, label, default, f"typ. {typical}")
+
+    loss_keys = [k for k, *_ in LOSS_FIELDS] + [a_key]
+    table_keys = ["gain", "rcs"] + loss_keys
+
+    # ---- helpers ----
+    def parse(key, optional=False):
+        raw = vars_[key].get().strip().replace(",", ".")
+        name = labels[key].cget("text")
+        if raw == "":
+            if optional:
+                return None
+            raise ValueError(f"{name}: value is required.")
+        try:
+            value = float(raw)
+        except ValueError:
+            raise ValueError(f"{name}: not a valid number.") from None
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be a finite number.")
+        return value
+
+    def parse_list(key):
+        """Comma separated list of positive numbers (dot as decimal mark)."""
+        name = labels[key].cget("text")
+        raw = vars_[key].get().replace(";", ",").replace(" ", ",")
+        parts = [x for x in raw.split(",") if x.strip()]
+        if not parts:
+            raise ValueError(f"{name}: at least one value is required.")
+        values = []
+        for part in parts:
+            try:
+                v = float(part)
+            except ValueError:
+                raise ValueError(f"{name}: '{part}' is not a valid number "
+                                 "(use a dot as decimal mark).") from None
+            if not math.isfinite(v):
+                raise ValueError(f"{name}: values must be finite numbers.")
+            values.append(v)
+        return values
+
+    def parse_int(key):
+        value = parse(key)
+        if value < 1 or abs(value - round(value)) > 1e-9:
+            raise ValueError(f"{labels[key].cget('text')}: must be a "
+                             "positive integer.")
+        return int(round(value))
+
+    def set_quiet(key, value):
+        """Set an entry without triggering a recalculation."""
+        state["suppress"] = True
+        vars_[key].set(value)
+        state["suppress"] = False
+
+    def on_table_toggle(key):
+        entries[key].state(["disabled"] if table_flags[key].get()
+                           else ["!disabled"])
+        schedule()
+
+    def apply_table_availability(first_time=False):
+        for key in table_keys:
+            available = TABLE_NAME.get(key, key) in state["tables"]
+            if available:
+                table_checks[key].state(["!disabled"])
+                if first_time:
+                    table_flags[key].set(True)
+            else:
+                table_flags[key].set(False)
+                table_checks[key].state(["disabled"])
+            entries[key].state(["disabled"] if table_flags[key].get()
+                               else ["!disabled"])
+
+    def reload_tables():
+        state["tables"], state["table_msgs"] = load_tables(table_dir)
+        apply_table_availability()
+        calculate()
+
+    def update_suggested(*_):
+        try:
+            mop = mop_var.get()
+            pw = parse("pw")
+            param = None if mop == "None" else parse("mop_param")
+            b_sig, _note = signal_bandwidth_hz(pw, mop, param)
+            suggested["mhz"] = b_sig / 1e6
+            labels["bw"].config(
+                text=f"Receiver bandwidth (MHz) "
+                     f"(suggested: {suggested['mhz']:.4g})")
+        except (ValueError, ZeroDivisionError, OverflowError):
+            suggested["mhz"] = None
+            labels["bw"].config(text="Receiver bandwidth (MHz) (suggested: -)")
+
+    saved_param = dict(MOP_PARAM_DEFAULT)
+    current = {"mop": "None"}
+
+    def on_mop_change(*_):
+        old = current["mop"]
+        if old != "None":
+            saved_param[old] = vars_["mop_param"].get()
+        new = mop_var.get()
+        current["mop"] = new
+        if new == "None":
+            labels["mop_param"].config(text="MOP parameter (n/a)")
+            set_quiet("mop_param", "")
+            entries["mop_param"].state(["disabled"])
+        else:
+            labels["mop_param"].config(text=MOP_PARAM_LABEL[new])
+            entries["mop_param"].state(["!disabled"])
+            set_quiet("mop_param", saved_param[new])
+        update_suggested()
+        schedule()
+
+    def spread(values, fmt):
+        a, b = fmt.format(min(values)), fmt.format(max(values))
+        return a if a == b else f"{a} - {b}"
+
+    def update_derived(*_):
+        """PRF, FFT size and the computed one of CPI time / pulse count."""
+        if state["suppress"]:
+            return
+        switch = pri_mode_var.get() == "PRI Switcher"
+        count = cpi_mode_var.get() == "Pulse count"
+        shown = "cpi" if count else "npulse"       # the computed entry
+        try:
+            pris = parse_list("pri") if switch else [parse("pri")]
+            if min(pris) <= 0:
+                raise ValueError("PRI must be positive.")
+            set_quiet("prf", ", ".join(f"{1e6 / p:.2f}" for p in pris))
+            if count:
+                n = parse_int("npulse")
+                ns = [n] * len(pris)
+                set_quiet("cpi", spread([n * p / 1000.0 for p in pris], "{:.4g}"))
+            else:
+                cpi = parse("cpi")
+                ns = [math.floor(cpi * 1000.0 / p + 1e-9) for p in pris]
+                set_quiet("npulse", spread(ns, "{:d}") if min(ns) >= 1
+                          else "< 1 (CPI shorter than PRI)")
+            if min(ns) < 1:
+                raise ValueError("no pulse in CPI")
+            set_quiet("fft", ", ".join(str(fft_size(n)) for n in ns))
+        except ValueError:
+            for key in ("prf", "fft", shown):
+                set_quiet(key, "-")
+
+    saved_cpi = {"cpi": "10", "npulse": "100"}
+    cpi_cur = {"mode": "CPI time"}
+
+    def on_cpi_mode_change(*_):
+        old_key = "cpi" if cpi_cur["mode"] == "CPI time" else "npulse"
+        saved_cpi[old_key] = vars_[old_key].get()
+        new = cpi_mode_var.get()
+        cpi_cur["mode"] = new
+        key, other = (("cpi", "npulse") if new == "CPI time"
+                      else ("npulse", "cpi"))
+        set_quiet(key, saved_cpi[key])
+        entries[key].state(["!disabled"])
+        entries[other].state(["disabled"])
+        update_derived()
+        schedule()
+
+    saved_pri = {"PRI Stable": "100", "PRI Switcher": PRI_LIST_DEFAULT}
+    pri_cur = {"mode": "PRI Stable"}
+
+    def on_pri_mode_change(*_):
+        saved_pri[pri_cur["mode"]] = vars_["pri"].get()
+        new = pri_mode_var.get()
+        pri_cur["mode"] = new
+        if new == "PRI Switcher":
+            labels["pri"].config(text="PRI list (us, comma separated)")
+            labels["cpi"].config(text="CPI = dwell per PRI (ms)")
+            labels["npulse"].config(text="Pulses per dwell (N)")
+        else:
+            labels["pri"].config(text="PRI (us)")
+            labels["cpi"].config(text="CPI (ms)")
+            labels["npulse"].config(text="Pulses per CPI (N)")
+        set_quiet("pri", saved_pri[new])
+        update_derived()
+        schedule()
+
+    def show(msg, status=None):
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.insert("1.0", msg)
+        if status is not None:
+            text.tag_add(status, "1.0", "1.end")
+        text.configure(state="disabled")
+
+    def gather():
+        mop = mop_var.get()
+        switch = pri_mode_var.get() == "PRI Switcher"
+        count = cpi_mode_var.get() == "Pulse count"
+        return {
+            "p_dbm": parse("p_dbm"), "pw": parse("pw"),
+            "pri_mode": "switch" if switch else "stable",
+            "pri_list": parse_list("pri") if switch else [parse("pri")],
+            "mop": mop,
+            "mop_param": None if mop == "None" else parse("mop_param"),
+            "bw": parse("bw"), "freq": parse("freq"), "nf": parse("nf"),
+            "snr": parse("snr"), "temp": parse("temp"), "cpi": None if count else parse("cpi"),
+            "n_pulses": parse_int("npulse") if count else None,
+            "pol": POL_CODE[pol_var.get()],
+            "ant_az": parse("ant_az"), "ant_el": parse("ant_el"),
+            "gain_table": table_flags["gain"].get(),
+            "gain_manual": None if table_flags["gain"].get() else parse("gain"),
+            "rcs_table": table_flags["rcs"].get(),
+            "rcs_manual": None if table_flags["rcs"].get() else parse("rcs"),
+            "tgt_range": parse("tgt_range"), "tgt_az": parse("tgt_az"),
+            "tgt_el": parse("tgt_el"), "tgt_heading": parse("tgt_heading"),
+            "tgt_speed": parse("tgt_speed"),
+            "loss_table": {k: table_flags[k].get() for k in loss_keys},
+            "loss_manual": {k: (None if table_flags[k].get() else parse(k))
+                            for k in loss_keys},
+            "rain_rate": parse("rain_rate"), "rain_path": parse("rain_path"),
+            "notes": list(state["table_msgs"]),
+        }
+
+    def calculate(live=False):
+        state["pending"] = None
+        try:
+            res = evaluate(gather(), state["tables"])
+        except (ValueError, OverflowError, ZeroDivisionError, KeyError) as exc:
+            for key, _t, _l in measure_keys:
+                set_quiet(key, "-")
+            if live:
+                show(f"Input error: {exc}\n\n"
+                     "Results update automatically when all inputs are valid.")
+            else:
+                messagebox.showerror("Invalid input", str(exc))
+            return
+        show(format_result(res, table_dir), res["status_kind"])
+        mf["res"] = res
+        geo["res"] = res
+        redraw_mf()
+        redraw_geo()
+        summary = target_summary(res, short=True)
+        for key, tkey, _l in measure_keys:
+            set_quiet(key, summary[tkey])
+        # Show table-derived values in their (disabled) entries
+        if table_flags["gain"].get():
+            set_quiet("gain", f"{res['gain_dbi']:.2f}")
+        if table_flags["rcs"].get():
+            set_quiet("rcs", f"{res['rcs_m2']:.4g}")
+        for key in loss_keys:
+            if table_flags[key].get():
+                set_quiet(key, f"{res['loss_values'][key]:.4g}")
+
+    def schedule(*_):
+        """Debounced live recalculation."""
+        if state["suppress"]:
+            return
+        if state["pending"] is not None:
+            root.after_cancel(state["pending"])
+        state["pending"] = root.after(80, lambda: calculate(live=True))
+
+    buttons = ttk.Frame(main)
+    buttons.grid(row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 12))
+    buttons.columnconfigure(0, weight=1)
+    ttk.Button(buttons, text="Calculate", command=calculate).grid(
+        row=0, column=0, sticky="ew")
+    ttk.Button(buttons, text="Reload tables", command=reload_tables).grid(
+        row=0, column=1, padx=(8, 0))
+
+    # ---- wiring ----
+    mop_box.bind("<<ComboboxSelected>>", on_mop_change)
+    pri_mode_box.bind("<<ComboboxSelected>>", on_pri_mode_change)
+    cpi_mode_box.bind("<<ComboboxSelected>>", on_cpi_mode_change)
+    for key in ("pri", "cpi", "npulse"):
+        vars_[key].trace_add("write", update_derived)
+    pol_box.bind("<<ComboboxSelected>>", schedule)
+    vars_["pw"].trace_add("write", update_suggested)
+    vars_["mop_param"].trace_add("write", update_suggested)
+    for var in vars_.values():
+        var.trace_add("write", schedule)
+    root.bind("<Return>", lambda _e: calculate())
+
+    on_mop_change()
+    on_cpi_mode_change()
+    apply_table_availability(first_time=True)
+    calculate()
+    return root
+
+
+def main():
+    build_gui().mainloop()
+
+
+if __name__ == "__main__":
+    main()

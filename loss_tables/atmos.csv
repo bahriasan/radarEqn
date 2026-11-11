@@ -1,0 +1,33 @@
+# Clear-air atmospheric attenuation, ONE-WAY, dB/km
+# Sea level, standard atmosphere (7.5 g/m^3 water vapour)
+# Approximate values read from ITU-R P.676 curves (+/-20%).
+# Replace with your own data if you need better accuracy.
+freq_ghz,db_per_km
+1,0.0054
+2,0.0064
+3,0.0071
+4,0.0077
+5,0.0084
+6,0.0091
+8,0.0108
+10,0.0132
+12,0.017
+14,0.023
+16,0.033
+18,0.056
+20,0.1
+22.2,0.18
+24,0.16
+26,0.13
+30,0.11
+35,0.12
+40,0.15
+45,0.25
+50,0.5
+55,3.0
+60,15.0
+65,2.0
+70,0.5
+80,0.3
+94,0.4
+100,0.45

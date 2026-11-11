@@ -1,0 +1,8 @@
+# DUMMY radome loss, TWO-WAY, dB - replace with radome data.
+# Columns per polarisation: H, V, C (circular).
+freq_ghz,H,V,C
+1,0.5,0.7,0.6
+5,0.7,0.9,0.8
+10,1.0,1.2,1.1
+18,1.3,1.6,1.45
+35,2.0,2.4,2.2
