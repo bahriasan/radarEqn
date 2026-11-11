@@ -131,6 +131,7 @@ MOP_PARAM_DEFAULT = {"LFM": "10", "Phase code": "13"}
 
 PRI_MODES = ("PRI Stable", "PRI Switcher")
 CPI_MODES = ("CPI time", "Pulse count")
+PW_MODES = ("Pulse width", "Duty cycle")
 PRI_LIST_DEFAULT = "100, 110, 121"          # us, used when PRI Switcher is chosen
 STATUS_COLOR = {"ok": "#1a7f37", "warn": "#b9770e", "bad": "#c0392b"}
 
@@ -157,6 +158,7 @@ LOSS_FIELDS = [
 ]
 ATMOS_FIELD = ("atmos", "Atmospheric atten., 1-way (dB/km)", "0.013",
                "X-band clear 0.01-0.02")
+NF_FIELD = ("nf", "Noise figure (dB)", "10", "LNA 1-2.2 (without line/radome loss)")
 RAIN_FIELDS = [
     ("rain_rate", "Rain rate (mm/h)", "0", "4 moderate, 16 heavy"),
     ("rain_path", "Rain path length (km, 0 = full)", "0", "-"),
@@ -178,6 +180,10 @@ GRID_COLUMNS = {"antenna_gain": 4, "rcs": 5}
 # Default tables (written to loss_tables/ on first run)
 # -----------------------------------------------------------------
 
+DUMMY_FREQS_GHZ = (2, 3, 4, 5, 6, 8, 10, 12, 15, 18, 20, 22, 24, 26, 28,
+                   30, 32, 35, 38, 40)
+
+
 def _pattern_rel_db(theta, beamwidth):
     """Dummy pattern cut: Gaussian main beam + sloping sidelobe floor."""
     main = -12.0 * (theta / beamwidth) ** 2
@@ -189,7 +195,7 @@ def _dummy_gain_rows():
     angles = [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 10, 12, 15,
               20, 25, 30, 40, 50, 60, 75, 90, 120, 150, 180]
     rows = []
-    for f in (2, 5, 8, 10, 12, 15, 18):
+    for f in DUMMY_FREQS_GHZ:
         g0 = 30.0 + 20.0 * math.log10(f / 10.0)     # fixed aperture
         bw_az = 4.0 * 10.0 / f                      # 3 dB beamwidths
         bw_el = 10.0 * 10.0 / f
@@ -205,7 +211,11 @@ def _dummy_rcs_rows():
     base_h = [1.0, 1.2, 1.8, 2.5, 3.5, 6.0, 15.0, 40.0, 15.0, 6.0,
               4.0, 3.0, 3.5, 4.5, 6.0]
     rows = []
-    for f, scale in ((1, 0.7), (3, 0.85), (10, 1.0), (35, 1.2)):
+    anchors = ((2, 0.78), (10, 1.0), (35, 1.2), (40, 1.22))   # (GHz, scale)
+    for f in DUMMY_FREQS_GHZ:
+        (f0, s0), (f1, s1) = next(
+            (a, b) for a, b in zip(anchors, anchors[1:]) if f <= b[0])
+        scale = s0 + (s1 - s0) * (math.log10(f / f0) / math.log10(f1 / f0))
         for a, h in zip(aspects, base_h):
             h = h * scale
             rows.append((f, a, round(h, 4), round(0.85 * h, 4),
@@ -216,48 +226,91 @@ def _dummy_rcs_rows():
 DEFAULT_TABLES = {
     "atmos": {
         "comment": [
-            "Clear-air atmospheric attenuation, ONE-WAY, dB/km",
-            "Sea level, standard atmosphere (7.5 g/m^3 water vapour)",
-            "Approximate values read from ITU-R P.676 curves (+/-20%).",
+            "Clear-air gaseous attenuation, ONE-WAY, dB/km (oxygen + water vapour)",
+            "Computed with ITU-Rpy 0.4.0 (itur.models.itu676 gamma0_exact + gammaw_exact),",
+            "which implements Recommendation ITU-R P.676-12 line-by-line.",
+            "Reference atmosphere: 1013.25 hPa, 15 C (288.15 K), 7.5 g/m^3 water vapour.",
             "Gaseous attenuation does not depend on polarisation.",
         ],
         "header": ["freq_ghz", "db_per_km"],
         "rows": [
-            (1, 0.0054), (2, 0.0064), (3, 0.0071), (4, 0.0077),
-            (5, 0.0084), (6, 0.0091), (8, 0.0108), (10, 0.0132),
-            (12, 0.0170), (14, 0.0230), (16, 0.0330), (18, 0.0560),
-            (20, 0.100), (22.2, 0.180), (24, 0.160), (26, 0.130),
-            (30, 0.110), (35, 0.120), (40, 0.150), (45, 0.250),
-            (50, 0.500), (55, 3.0), (60, 15.0), (65, 2.0),
-            (70, 0.50), (80, 0.30), (94, 0.40), (100, 0.45),
+            (1, 0.00544),
+            (2, 0.00692),
+            (3, 0.00754),
+            (4, 0.00809),
+            (5, 0.00871),
+            (6, 0.00946),
+            (7, 0.01035),
+            (8, 0.01142),
+            (9, 0.01268),
+            (10, 0.0142),
+            (11, 0.01602),
+            (12, 0.01823),
+            (13, 0.02098),
+            (14, 0.02447),
+            (15, 0.02906),
+            (16, 0.03532),
+            (17, 0.04423),
+            (18, 0.05751),
+            (19, 0.07792),
+            (20, 0.10893),
+            (21, 0.15043),
+            (22, 0.18734),
+            (22.235, 0.19227),
+            (23, 0.19429),
+            (24, 0.17316),
+            (25, 0.14623),
+            (26, 0.12503),
+            (27, 0.11074),
+            (28, 0.10176),
+            (29, 0.09649),
+            (30, 0.09382),
+            (31, 0.09302),
+            (32, 0.09362),
+            (33, 0.09533),
+            (34, 0.09798),
+            (35, 0.10146),
+            (36, 0.10572),
+            (37, 0.11076),
+            (38, 0.11662),
+            (39, 0.12335),
+            (40, 0.13109),
+            (50, 0.38843),
+            (60, 14.7783),
+            (80, 0.34237),
+            (100, 0.45806),
         ],
     },
     "rain_coeffs": {
         "comment": [
             "Rain specific attenuation coefficients, ITU-R P.838-3",
             "gamma [dB/km] = k * R^alpha, R = rain rate (mm/h)",
-            "Values transcribed approximately; verify for critical use.",
+            "Computed with ITU-Rpy 0.4.0 (itur.models.itu838, P.838-3 coefficients),",
+            "horizontal (tau = 0) and vertical (tau = 90) polarisation, theta = 0.",
             "Polarisation / elevation combination per P.838 (tau, theta).",
         ],
         "header": ["freq_ghz", "kH", "alphaH", "kV", "alphaV"],
         "rows": [
-            (1, 0.0000259, 0.9691, 0.0000308, 0.8592),
-            (2, 0.0000847, 1.0664, 0.0000998, 0.9490),
-            (4, 0.0001071, 1.6009, 0.0002461, 1.2476),
-            (6, 0.0007056, 1.5900, 0.0004878, 1.5728),
-            (8, 0.004115, 1.3905, 0.003450, 1.3797),
-            (10, 0.01217, 1.2571, 0.01129, 1.2156),
-            (12, 0.02386, 1.1825, 0.02455, 1.1216),
-            (15, 0.04481, 1.1233, 0.05008, 1.0440),
-            (20, 0.09164, 1.0568, 0.09611, 0.9847),
-            (25, 0.1571, 0.9991, 0.1533, 0.9491),
-            (30, 0.2403, 0.9485, 0.2291, 0.9129),
-            (35, 0.3374, 0.9047, 0.3224, 0.8761),
-            (40, 0.4431, 0.8673, 0.4274, 0.8421),
-            (50, 0.6600, 0.8084, 0.6472, 0.7871),
-            (60, 0.8606, 0.7656, 0.8515, 0.7486),
-            (80, 1.1704, 0.7115, 1.1668, 0.7021),
-            (100, 1.3671, 0.6815, 1.3680, 0.6721),
+            (1, 2.58927e-05, 0.969074, 3.07974e-05, 0.859221),
+            (2, 8.46869e-05, 1.06642, 9.97661e-05, 0.948961),
+            (3, 0.000138979, 1.23216, 0.000194232, 1.06876),
+            (4, 0.000107135, 1.60088, 0.000246077, 1.24755),
+            (5, 0.00021615, 1.69693, 0.000242764, 1.53173),
+            (6, 0.000705587, 1.59005, 0.000487825, 1.57276),
+            (8, 0.00411543, 1.39051, 0.00344982, 1.37974),
+            (10, 0.012167, 1.2571, 0.0112919, 1.21565),
+            (12, 0.0238578, 1.18247, 0.0245483, 1.12159),
+            (15, 0.0448146, 1.12328, 0.0500825, 1.04399),
+            (18, 0.0707841, 1.08183, 0.0770761, 1.0025),
+            (20, 0.0916427, 1.05678, 0.0961112, 0.98469),
+            (25, 0.15709, 0.999128, 0.153269, 0.949132),
+            (30, 0.240308, 0.948457, 0.22909, 0.912923),
+            (35, 0.337387, 0.904713, 0.322376, 0.876142),
+            (40, 0.443057, 0.867306, 0.427375, 0.842053),
+            (50, 0.659958, 0.808352, 0.647215, 0.787136),
+            (60, 0.860613, 0.765632, 0.85152, 0.748565),
+            (80, 1.17045, 0.711495, 1.16683, 0.702076),
+            (100, 1.36711, 0.68145, 1.36805, 0.676541),
         ],
     },
     "antenna_gain": {
@@ -278,17 +331,6 @@ DEFAULT_TABLES = {
         ],
         "header": ["freq_ghz", "aspect_deg", "H", "V", "C"],
         "rows": _dummy_rcs_rows(),
-    },
-    "radome": {
-        "comment": [
-            "DUMMY radome loss, TWO-WAY, dB - replace with radome data.",
-            "Columns per polarisation: H, V, C (circular).",
-        ],
-        "header": ["freq_ghz", "H", "V", "C"],
-        "rows": [
-            (1, 0.5, 0.7, 0.6), (5, 0.7, 0.9, 0.8), (10, 1.0, 1.2, 1.1),
-            (18, 1.3, 1.6, 1.45), (35, 2.0, 2.4, 2.2),
-        ],
     },
 }
 
@@ -1314,7 +1356,7 @@ def evaluate(inp, tables):
 
     # ---- losses ----
     values = {}
-    for key in [k for k, *_ in LOSS_FIELDS] + [ATMOS_FIELD[0]]:
+    for key in [k for k, *_ in LOSS_FIELDS] + [ATMOS_FIELD[0], NF_FIELD[0]]:
         if inp["loss_table"].get(key):
             sources[key] = use(key)
             value, note = table_value(tables, key, freq, pol)
@@ -1344,7 +1386,7 @@ def evaluate(inp, tables):
     res = radar_calc(
         p_dbm=inp["p_dbm"], pri_list_us=pri_list, pw_us=inp["pw"],
         mop=inp["mop"], mop_param=inp["mop_param"], bw_mhz=inp["bw"],
-        freq_ghz=freq, nf_db=inp["nf"], snr_db=inp["snr"],
+        freq_ghz=freq, nf_db=values["nf"], snr_db=inp["snr"],
         temp_k=inp["temp"], cpi_ms=inp.get("cpi"),
         n_pulses=inp.get("n_pulses"), speed_ms=speed, radial_ms=radial,
         gain_dbi=gain, gain_peak_dbi=peak, rcs_m2=rcs,
@@ -1628,6 +1670,10 @@ def format_result(res, table_dir=None):
     for name, value, note in res["budget"]:
         suffix = f"  ({note})" if note else ""
         out.append(line(name, f"{value:5.2f} dB{suffix}"))
+    out.append("  " + "-" * 44)
+    out.append(line("TOTAL LOSSES (budget)",
+                    f"{sum(v for _n, v, _s in res['budget']):5.2f} dB"))
+    out.append("")
 
     if res["rain_rate"] > 0:
         rain_txt = f"{res['rain_rate']:g} mm/h, "
@@ -1916,6 +1962,154 @@ def draw_mf(fig, res, sim):
     for ax in (ax1, ax2, ax3):
         ax.tick_params(labelsize=7)
         ax.grid(alpha=0.25)
+    fig.tight_layout()
+
+
+def doppler_window(name, n):
+    """Slow-time weighting window (numpy array of n weights)."""
+    if name == "Hamming":
+        return np.hamming(n)
+    if name == "Hann":
+        return np.hanning(n + 2)[1:-1]
+    if name == "Blackman":
+        return np.blackman(n + 2)[1:-1]
+    return np.ones(n)
+
+
+DOPPLER_WINDOWS = ("Rectangular", "Hamming", "Hann", "Blackman")
+
+
+def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
+    """
+    Doppler filter bank and the target's Doppler line for the limiting dwell.
+
+    Slow time: n pulses, one complex sample per PRI at the target range gate,
+        x[k] = a exp(j 2 pi f_app k PRI) + complex white noise,
+    f_app = true Doppler folded into +-PRF/2 (aliasing included). The n-point
+    weighted FFT (zero padded to the next power of two >= n) is the bank of
+    nfft Doppler filters; bin spacing PRF / nfft. The amplitude is calibrated
+    so that the noise-free filter output at the target Doppler / mean noise
+    power = integrated SNR from the radar equation (res["snr_int_tgt_db"]).
+    """
+    d = res["dwells"][res["lim"]]
+    n = d["n"]
+    if n < 2:
+        raise ValueError("Only 1 pulse per dwell: there is no Doppler "
+                         "processing (Doppler resolution = PRF).")
+    prf = d["prf_hz"]
+    f_app = d["dop_app_hz"]
+    nfft = d["n_fft"]
+    m = nfft * max(1, -(-grid // nfft))          # padded length, multiple
+    w = doppler_window(window, n)
+    sw, sw2 = float(np.sum(w)), float(np.sum(w ** 2))
+    pl_db = 10 * math.log10(n * sw2 / sw ** 2)    # window processing loss
+
+    freq = np.fft.fftshift(np.fft.fftfreq(m, 1 / prf))
+    wmag = np.abs(np.fft.fft(w, m)) / sw          # filter shape, 1 at peak
+    ks = list(range(nfft))
+    if nfft > 64:                                 # draw only the neighbours
+        centre = int(round((f_app % prf) / prf * nfft)) % nfft
+        ks = sorted({(centre + o) % nfft for o in range(-4, 5)})
+    bank = []
+    for k in ks:
+        h = np.roll(wmag, k * (m // nfft))        # filter centred at k*PRF/nfft
+        bank.append(np.fft.fftshift(h))
+    centres = [((k if k < nfft / 2 else k - nfft) * prf / nfft) for k in ks]
+
+    snr_db = res["snr_int_tgt_db"]
+    amp = math.sqrt(10 ** (snr_db / 10) * sw2 / sw ** 2)
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / prf
+    noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / math.sqrt(2)
+    clean = amp * np.exp(2j * math.pi * f_app * t)
+
+    def spec(x, size):
+        return 10 * np.log10(np.maximum(
+            np.abs(np.fft.fft(w * x, size)) ** 2 / sw2, 1e-12))
+
+    bins_total = spec(clean + noise, nfft)
+    return {
+        "window": window, "n": n, "prf": prf, "nfft": nfft, "freq": freq,
+        "bank": np.array(bank), "centres": centres,
+        "fine_clean": np.fft.fftshift(spec(clean, m)),
+        "fine_total": np.fft.fftshift(spec(clean + noise, m)),
+        "bin_f": np.fft.fftshift(np.fft.fftfreq(nfft, 1 / prf)),
+        "bin_total": np.fft.fftshift(bins_total),
+        "f_app": f_app, "f_true": res["f_dop_hz"], "aliased": d["dop_aliased"],
+        "snr_db": snr_db, "thr_db": res["snr_req_db"],
+        "measured_db": float(np.max(bins_total)), "pl_db": pl_db,
+        "df_res": d["df_res_hz"], "dv_res": d["dv_res"],
+        "wavelength": res["wavelength"],
+    }
+
+
+def draw_doppler(fig, res, sim):
+    """Doppler filter bank (top) and target Doppler line (bottom)."""
+    fig.clear()
+    ax1, ax2 = fig.subplots(2, 1, gridspec_kw={"height_ratios": [1, 1.2]})
+    lam, prf = sim["wavelength"], sim["prf"]
+    half = prf / 2.0
+    f = sim["freq"]
+    for h in sim["bank"]:
+        ax1.plot(f, 20 * np.log10(np.maximum(h, 1e-6)), color="#9aa5b1",
+                 lw=0.7)
+    # filter that holds the target
+    j = int(np.argmin(np.abs(np.array(sim["centres"]) - sim["f_app"])))
+    hj = 20 * np.log10(np.maximum(sim["bank"][j], 1e-6))
+    ax1.plot(f, hj, color="#c0392b", lw=1.6,
+             label="filter containing the target")
+    ax1.axvline(sim["f_app"], color="green", lw=1.0, ls="--",
+                label=f"target line {sim['f_app']:+,.0f} Hz")
+    ax1.set_ylim(-60, 3)
+    ax1.set_ylabel("filter response (dB)", fontsize=8)
+    shown = "all" if len(sim["bank"]) == sim["nfft"] else "nearest 9"
+    ax1.set_title(
+        f"Doppler filter bank: {sim['nfft']} filters ({shown} drawn), "
+        f"{sim['window']} window\n"
+        f"spacing {prf / sim['nfft']:.1f} Hz, resolution "
+        f"{sim['df_res']:.1f} Hz = {sim['dv_res']:.2f} m/s",
+        fontsize=9, pad=34)
+    ax1.legend(loc="upper right", fontsize=7)
+
+    ax2.plot(f, sim["fine_total"], color="#4a90c2", lw=0.8, alpha=0.9,
+             label="signal + noise (filter outputs)")
+    ax2.plot(f, sim["fine_clean"], color="#e67e22", lw=1.5,
+             label="signal only", zorder=3)
+    ax2.plot(sim["bin_f"], sim["bin_total"], ".", color="#1f4e79", ms=4,
+             label="FFT bins")
+    ax2.axhline(0, color="gray", ls="--", lw=1.2,
+                label="noise floor (mean power)")
+    ax2.axhline(sim["thr_db"], color="#c0392b", ls="--", lw=1.2,
+                label=f"required SNR ({sim['thr_db']:.1f} dB)")
+    ax2.axvline(sim["f_app"], color="green", lw=0.8, alpha=0.6)
+    top = max(10.0, sim["snr_db"] + 8, sim["thr_db"] + 8)
+    ax2.set_ylim(-30, top)
+    ax2.set_ylabel("power re noise (dB)", fontsize=8)
+    ax2.set_xlabel("Doppler (Hz)", fontsize=8)
+    v_true = sim["f_true"] * lam / 2
+    note = (f"ALIASED: true {sim['f_true']:+,.0f} Hz ({v_true:+.1f} m/s) "
+            f"folds to {sim['f_app']:+,.0f} Hz" if sim["aliased"]
+            else f"true Doppler {sim['f_true']:+,.0f} Hz ({v_true:+.1f} m/s), "
+                 "inside +-PRF/2")
+    budget_loss = next((v for name, v, _n in res["budget"]
+                        if name.startswith("Doppler window")), None)
+    loss_txt = (f"; window loss {sim['pl_db']:.2f} dB here vs "
+                f"{budget_loss:.2f} dB in the loss budget"
+                if budget_loss is not None else "")
+    ax2.set_title(
+        f"Target Doppler line, N = {sim['n']}, PRF {prf:,.0f} Hz\n{note}\n"
+        f"peak SNR {sim['snr_db']:.1f} dB (theory), "
+        f"{sim['measured_db']:.1f} dB (this noise sample)\n"
+        f"{loss_txt.lstrip('; ')}", fontsize=9)
+    ax2.legend(loc="upper right", fontsize=7)
+    for ax in (ax1, ax2):
+        ax.set_xlim(-half, half)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.25)
+    sec = ax1.secondary_xaxis(
+        "top", functions=(lambda x: x * lam / 2, lambda v: v * 2 / lam))
+    sec.set_xlabel("radial velocity (m/s)", fontsize=8)
+    sec.tick_params(labelsize=7)
     fig.tight_layout()
 
 
@@ -2297,6 +2491,107 @@ def make_scrollable(parent):
     return outer, inner
 
 
+# =================================================================
+# MAX RANGE SWEEP (pure, no GUI)
+# =================================================================
+
+# key: (label, unit, default from, default to, log spacing, integer)
+SWEEP_PARAMS = {
+    "pri":  ("PRI",                  "us",  100.0, 500.0, False, False),
+    "pw":   ("Pulse width PW",       "us",  0.2,   20.0,  True,  False),
+    "duty": ("Duty cycle (PRI fixed, PW follows)", "%", 1.0, 10.0, False, False),
+    "p_dbm": ("Peak power",          "dBm", 50.0,  70.0,  False, False),
+    "n":    ("Pulse count N",        "",    8,     128,   True,  True),
+    "gain": ("Antenna gain",         "dBi", 30.0,  50.0,  False, False),
+    "rcs":  ("RCS",                  "m^2", 0.01,  10.0,  True,  False),
+}
+
+
+def sweep_values(lo, hi, steps, log=False, integer=False):
+    """Evenly (or log-evenly) spaced values from lo to hi, inclusive."""
+    if steps < 2 or steps > 500:
+        raise ValueError("Steps must be between 2 and 500.")
+    if hi < lo:
+        raise ValueError("'To' must not be smaller than 'From'.")
+    if log and lo <= 0:
+        raise ValueError("Log spacing needs a positive 'From' value.")
+    if log:
+        ratio = (hi / lo) ** (1.0 / (steps - 1))
+        values = [lo * ratio ** i for i in range(steps)]
+    else:
+        values = [lo + (hi - lo) * i / (steps - 1) for i in range(steps)]
+    if integer:
+        values = sorted({max(1, int(round(v))) for v in values})
+    return values
+
+
+def run_sweep(inp, tables, param, values, match_bw=True):
+    """
+    Detection range for each value of one parameter, everything else as in
+    inp (the normal evaluate() input). Returns a list of dicts
+    {value, r_coh, r_single, status, error, range_res (m), dv_res (m/s),
+    df_res (Hz), sig_v_tgt / sig_v_thr (m/s), sig_f_tgt / sig_f_thr (Hz)};
+    r_* are metres. The resolution / accuracy values are those of the
+    limiting dwell (None on error). sig_*_tgt = Doppler accuracy (1 sigma)
+    at the SNR of the target, sig_*_thr = at the required SNR.
+
+    param: "pri" | "pw" | "duty" | "p_dbm" | "n" | "gain" | "rcs"
+           "duty" = duty cycle in %, PRI stays fixed and PW = duty x PRI
+           (shortest PRI if several)
+    n, gain and rcs force the manual / pulse-count input path.
+    match_bw: with param "pw", set the receiver bandwidth to the signal
+              bandwidth of each PW (otherwise B_rx stays as entered and the
+              bandwidth-mismatch loss changes with PW).
+    r_coh is the coherent detection range of the limiting dwell.
+    """
+    if param not in SWEEP_PARAMS:
+        raise ValueError(f"Unknown parameter {param}.")
+    if param == "pri" and inp.get("pri_mode") == "switch":
+        raise ValueError("Sweeping the PRI needs PRI Stable mode.")
+    rows = []
+    for v in values:
+        i = dict(inp)
+        try:
+            if param == "pri":
+                i["pri_list"] = [v]
+            elif param in ("pw", "duty"):
+                i["pw"] = (v if param == "pw"
+                           else v / 100.0 * min(i["pri_list"]))
+                if match_bw:
+                    b_sig, _note = signal_bandwidth_hz(
+                        i["pw"], i["mop"], i["mop_param"])
+                    i["bw"] = b_sig / 1e6
+            elif param == "p_dbm":
+                i["p_dbm"] = v
+            elif param == "n":
+                i["n_pulses"], i["cpi"] = int(v), None
+            elif param == "gain":
+                i["gain_table"], i["gain_manual"] = False, v
+            elif param == "rcs":
+                i["rcs_table"], i["rcs_manual"] = False, v
+            res = evaluate(i, tables)
+            d = min(res["dwells"], key=lambda x: x["int_gain_db"])
+            rows.append({"value": v, "r_coh": res["r_coh"],
+                         "r_single": res["r_single"],
+                         "status": res["status_text"], "error": None,
+                         "range_res": res["range_res"],
+                         "dv_res": d["dv_res"], "df_res": d["df_res_hz"],
+                         "sig_v_tgt": d["sig_v_tgt"],
+                         "sig_v_thr": d["sig_v_thr"],
+                         "sig_f_tgt": d["sig_f_tgt"],
+                         "sig_f_thr": d["sig_f_thr"]})
+        except (ValueError, OverflowError, ZeroDivisionError) as exc:
+            rows.append({"value": v, "r_coh": None, "r_single": None,
+                         "status": "", "error": str(exc)})
+    return rows
+
+
+def best_row(rows):
+    """Row with the longest coherent detection range (None if none valid)."""
+    valid = [r for r in rows if r["r_coh"] is not None]
+    return max(valid, key=lambda r: r["r_coh"]) if valid else None
+
+
 def build_gui():
     table_dir = default_table_dir()
     state = {"tables": None, "table_msgs": [], "suppress": False,
@@ -2337,6 +2632,10 @@ def build_gui():
     notebook.add(geo_tab, text="Geometry (2D)")
     geo_tab.columnconfigure(0, weight=1)
     geo_tab.rowconfigure(0, weight=1)
+    max_tab = ttk.Frame(notebook, padding=8)
+    notebook.add(max_tab, text="Optimizasyon")
+    max_tab.columnconfigure(0, weight=1)
+    max_tab.rowconfigure(1, weight=1)
 
     def tab_is(frame):
         return notebook.select() == str(frame)
@@ -2347,6 +2646,7 @@ def build_gui():
 
     mf = {"fig": None, "canvas": None, "res": None, "seed": 1}
     mf_mode = tk.StringVar(value="single")
+    mf_win = tk.StringVar(value="Hamming")
 
     def redraw_mf(*_):
         if mf["fig"] is None or mf["res"] is None:
@@ -2354,10 +2654,15 @@ def build_gui():
         if not tab_is(mf_tab):
             return                     # draw only when the tab is visible
         try:
-            sim = simulate_mf(mf["res"],
-                              integrated=mf_mode.get() == "integrated",
-                              seed=mf["seed"])
-            draw_mf(mf["fig"], mf["res"], sim)
+            if mf_mode.get() == "doppler":
+                sim = simulate_doppler(mf["res"], mf_win.get(),
+                                       seed=mf["seed"])
+                draw_doppler(mf["fig"], mf["res"], sim)
+            else:
+                sim = simulate_mf(mf["res"],
+                                  integrated=mf_mode.get() == "integrated",
+                                  seed=mf["seed"])
+                draw_mf(mf["fig"], mf["res"], sim)
         except ValueError as exc:
             mf["fig"].clear()
             msg = "\n".join(textwrap.wrap(str(exc), 60))
@@ -2378,6 +2683,13 @@ def build_gui():
         ttk.Radiobutton(ctrl, text="Coherent integration (N pulses)",
                         value="integrated", variable=mf_mode,
                         command=redraw_mf).pack(side="left", padx=(10, 0))
+        ttk.Radiobutton(ctrl, text="Doppler filters", value="doppler",
+                        variable=mf_mode, command=redraw_mf).pack(
+            side="left", padx=(10, 0))
+        win_box = ttk.Combobox(ctrl, textvariable=mf_win, width=11,
+                               state="readonly", values=DOPPLER_WINDOWS)
+        win_box.pack(side="left", padx=(4, 0))
+        win_box.bind("<<ComboboxSelected>>", redraw_mf)
         ttk.Button(ctrl, text="New noise", command=new_noise).pack(
             side="left", padx=(16, 0))
         mf["fig"] = Figure(figsize=(7, 7), dpi=100)
@@ -2421,9 +2733,180 @@ def build_gui():
                  "    pip install numpy matplotlib\n\n"
                  "Then restart the program.").grid(row=0, column=0, sticky="nw")
 
+    # ---- Max Range tab: sweep one parameter, find the longest range ----
+    sw_names = {p[0]: key for key, p in SWEEP_PARAMS.items()}
+    sw_param = tk.StringVar(value=SWEEP_PARAMS["pri"][0])
+    sw_lo, sw_hi = tk.StringVar(), tk.StringVar()
+    sw_steps = tk.StringVar(value="25")
+    sw_log = tk.BooleanVar(value=False)
+    sw_match = tk.BooleanVar(value=True)
+    sw_summary = tk.StringVar(
+        value="Choose a parameter and a range, then press Run sweep.")
+    sw = {"fig": None, "canvas": None, "rows": None, "unit_label": ""}
+
+    def sw_key():
+        return sw_names[sw_param.get()]
+
+    def sw_defaults(*_):
+        _label, unit, lo, hi, log, _int = SWEEP_PARAMS[sw_key()]
+        sw_lo.set(f"{lo:g}")
+        sw_hi.set(f"{hi:g}")
+        sw_log.set(log)
+        sw_unit.config(text=unit)
+        sw_match_chk.state(["!disabled"] if sw_key() in ("pw", "duty")
+                           else ["disabled"])
+
+    def run_max_range(quiet=False):
+        key = sw_key()
+        label, unit, _lo, _hi, _log, integer = SWEEP_PARAMS[key]
+        try:
+            lo = float(sw_lo.get().replace(",", "."))
+            hi = float(sw_hi.get().replace(",", "."))
+            steps = int(float(sw_steps.get().replace(",", ".")))
+            values = sweep_values(lo, hi, steps, sw_log.get(), integer)
+            rows = run_sweep(gather(), state["tables"], key, values,
+                             sw_match.get())
+        except ValueError as exc:
+            if quiet:
+                sw_summary.set(f"Optimizasyon: {exc}")
+            else:
+                messagebox.showerror("Optimizasyon", str(exc))
+            return
+        sw["rows"] = rows
+        sw["unit_label"] = f"{label} ({unit})" if unit else label
+        show_sweep(rows, label, unit)
+
+    def show_sweep(rows, label, unit):
+        best = best_row(rows)
+        bad = [r for r in rows if r["r_coh"] is None]
+        flat = False
+        if best is None:
+            msg = "No valid point in this range."
+        else:
+            vals = [r["r_coh"] for r in rows if r["r_coh"] is not None]
+            flat = max(vals) - min(vals) < 1e-3 * best["r_coh"]
+            if flat:
+                msg = (f"Range is {best['r_coh'] / 1000:.3f} km for every "
+                       f"value: it does not depend on {label} with the "
+                       "current inputs (e.g. PRI with a fixed pulse count "
+                       "only changes the CPI time).")
+            else:
+                at_edge = best is rows[0] or best is rows[-1]
+                msg = (f"Max coherent range {best['r_coh'] / 1000:.3f} km "
+                       f"at {label} = {best['value']:.6g} {unit}".rstrip()
+                       + ("   (at the edge of the range: the optimum may "
+                          "lie outside it)" if at_edge else ""))
+        if bad:
+            msg += (f"   [{len(bad)} invalid point(s), first: "
+                    f"{bad[0]['value']:.6g} -> {bad[0]['error']}]")
+        sw_summary.set(msg)
+        if sw["fig"] is None:
+            return
+        fig = sw["fig"]
+        fig.clear()
+        ok = [r for r in rows if r["r_coh"] is not None]
+        xs = [r["value"] for r in ok]
+        use_log = SWEEP_PARAMS[sw_key()][4] and bool(xs) and min(xs) > 0
+        axes = fig.subplots(2, 2).ravel()
+
+        def line(ax, key, scale, **kw):
+            pts = [(r["value"], r[key] * scale) for r in ok
+                   if r.get(key) is not None]
+            if pts:
+                ax.plot([p[0] for p in pts], [p[1] for p in pts], **kw)
+            return bool(pts)
+
+        a_rng, a_rr, a_dr, a_da = axes
+        line(a_rng, "r_coh", 1e-3, marker="o", ms=3, color="#2c7fb8",
+             label="Coherent (limiting dwell)")
+        line(a_rng, "r_single", 1e-3, marker="s", ms=3, ls="--",
+             color="#e67e22", label="Single pulse")
+        if best is not None:
+            a_rng.plot([best["value"]], [best["r_coh"] / 1000], "*", ms=14,
+                       color="#c0392b", label="Maximum")
+        a_rng.set_title("Detection range", fontsize=10)
+        a_rng.set_ylabel("km")
+        line(a_rr, "range_res", 1.0, marker="o", ms=3, color="#2c7fb8")
+        a_rr.set_title("Range resolution", fontsize=10)
+        a_rr.set_ylabel("m")
+        line(a_dr, "dv_res", 1.0, marker="o", ms=3, color="#2c7fb8")
+        a_dr.set_title("Doppler resolution", fontsize=10)
+        a_dr.set_ylabel("m/s")
+        has_tgt = line(a_da, "sig_v_tgt", 1.0, marker="o", ms=3,
+                       color="#2c7fb8", label="at target SNR")
+        line(a_da, "sig_v_thr", 1.0, marker="s", ms=3, ls="--",
+             color="#e67e22", label="at required SNR")
+        a_da.set_title("Doppler accuracy (1 sigma)", fontsize=10)
+        a_da.set_ylabel("m/s")
+        if not has_tgt:
+            a_da.text(0.5, 0.5, "needs N >= 2", ha="center", va="center",
+                      transform=a_da.transAxes, color="gray")
+        for ax in axes:
+            ax.set_xlabel(sw["unit_label"], fontsize=8)
+            ax.tick_params(labelsize=8)
+            ax.grid(True, alpha=0.3)
+            if use_log:
+                ax.set_xscale("log")
+            if ax.get_legend_handles_labels()[0]:
+                ax.legend(fontsize=7)
+        if not ok:
+            a_rng.text(0.5, 0.5, "No valid point", ha="center",
+                       va="center", transform=a_rng.transAxes)
+        fig.tight_layout()
+        sw["canvas"].draw_idle()
+
+    sw_ctrl = ttk.Frame(max_tab)
+    sw_ctrl.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    r1 = ttk.Frame(sw_ctrl)
+    r1.pack(fill="x")
+    r2 = ttk.Frame(sw_ctrl)
+    r2.pack(fill="x", pady=(4, 0))
+    ttk.Label(r1, text="Optimise").pack(side="left")
+    sw_box = ttk.Combobox(r1, textvariable=sw_param, state="readonly",
+                          width=34, values=[p[0] for p in
+                                            SWEEP_PARAMS.values()])
+    sw_box.pack(side="left", padx=(6, 12))
+    ttk.Button(r1, text="Run sweep", command=run_max_range).pack(
+        side="left")
+    ttk.Label(r1, text="(uses the current inputs on the left; Calculate is "
+              "not needed)", foreground="gray45").pack(
+        side="left", padx=(10, 0))
+    ttk.Label(r2, text="from").pack(side="left")
+    ttk.Entry(r2, textvariable=sw_lo, width=9).pack(
+        side="left", padx=(4, 8))
+    ttk.Label(r2, text="to").pack(side="left")
+    ttk.Entry(r2, textvariable=sw_hi, width=9).pack(
+        side="left", padx=(4, 4))
+    sw_unit = ttk.Label(r2, width=5, foreground="gray45")
+    sw_unit.pack(side="left")
+    ttk.Label(r2, text="steps").pack(side="left", padx=(8, 0))
+    ttk.Entry(r2, textvariable=sw_steps, width=5).pack(
+        side="left", padx=(4, 8))
+    ttk.Checkbutton(r2, text="log spacing", variable=sw_log).pack(
+        side="left")
+    sw_match_chk = ttk.Checkbutton(
+        r2, text="B_rx follows PW", variable=sw_match)
+    sw_match_chk.pack(side="left", padx=(8, 0))
+
+    if HAVE_PLOT:
+        sw["fig"] = Figure(figsize=(8, 6.5), dpi=100)
+        sw["canvas"] = FigureCanvasTkAgg(sw["fig"], master=max_tab)
+        sw["canvas"].get_tk_widget().grid(row=1, column=0, sticky="nsew")
+    else:
+        ttk.Label(max_tab, text="Install numpy and matplotlib for the "
+                  "plot (pip install numpy matplotlib).").grid(
+            row=1, column=0, sticky="nw")
+    ttk.Label(max_tab, textvariable=sw_summary,
+              font=("Segoe UI", 10, "bold")).grid(
+        row=2, column=0, sticky="w", pady=(6, 4))
+    sw_box.bind("<<ComboboxSelected>>", sw_defaults)
+    sw_defaults()
+
     def on_tab_changed(_event=None):
         redraw_mf()
         redraw_geo()
+        if tab_is(max_tab) and sw["rows"] is None:
+            run_max_range(quiet=True)       # first visit: show a sweep
 
     notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
 
@@ -2518,16 +3001,19 @@ def build_gui():
         vars_[key].trace_add("write", from_entry)
 
     # ---- radar ----
-    add_entry(radar_f, "p_dbm", "Peak power (dBm)", "80")
+    add_entry(radar_f, "p_dbm", "Peak power (dBm)", "61")
     pri_mode_var, pri_mode_box = add_combo(radar_f, "PRI mode", PRI_MODES,
                                            "PRI Stable")
-    add_entry(radar_f, "pri", "PRI (us)", "100")
+    add_entry(radar_f, "pri", "PRI (us)", "250")
     add_entry(radar_f, "prf", "PRF (Hz, auto = 1 / PRI)", "")
-    add_entry(radar_f, "pw", "Pulse width PW (us)", "1")
+    pw_mode_var, pw_mode_box = add_combo(radar_f, "PW defined by",
+                                         PW_MODES, "Pulse width")
+    add_entry(radar_f, "pw", "Pulse width PW (us)", "10")
+    add_entry(radar_f, "duty", "Duty cycle (%)", "")
     mop_var, mop_box = add_combo(radar_f, "Modulation on pulse (MOP)",
                                  MOP_OPTIONS, "None")
     add_entry(radar_f, "mop_param", "MOP parameter (n/a)", "")
-    bw_row = add_entry(radar_f, "bw", "Receiver bandwidth (MHz)", "1")
+    bw_row = add_entry(radar_f, "bw", "Receiver bandwidth (MHz)", "0.1")
     suggested = {"mhz": None}
 
     def use_suggested():
@@ -2536,20 +3022,22 @@ def build_gui():
 
     ttk.Button(radar_f, text="Use", width=5, command=use_suggested).grid(
         row=bw_row, column=2, padx=(8, 0), sticky="w")
-    add_entry(radar_f, "freq", "Frequency (GHz)", "10")
-    add_entry(radar_f, "nf", "Noise figure (dB)", "3")
+    add_entry(radar_f, "freq", "Frequency (GHz)", "16.5")
+    add_entry(radar_f, NF_FIELD[0], NF_FIELD[1], NF_FIELD[2],
+              f"typ. {NF_FIELD[3]}", table_key=True)
     add_entry(radar_f, "snr", "Required SNR (dB)", "13")
     add_entry(radar_f, "temp", "System temperature (K)", "290")
     cpi_mode_var, cpi_mode_box = add_combo(radar_f, "CPI defined by",
-                                           CPI_MODES, "CPI time")
+                                           CPI_MODES, "Pulse count")
     add_entry(radar_f, "cpi", "CPI (ms)", "10")
-    add_entry(radar_f, "npulse", "Pulses per CPI (N)", "100")
+    add_entry(radar_f, "npulse", "Pulses per CPI (N)", "32")
     add_entry(radar_f, "fft", "FFT points (auto, 2^k >= N)", "")
     entries["prf"].state(["disabled"])
     entries["fft"].state(["disabled"])
+    entries["duty"].state(["disabled"])
 
     # ---- antenna ----
-    add_entry(ant_f, "gain", "Gain toward target (dBi)", "30",
+    add_entry(ant_f, "gain", "Gain toward target (dBi)", "41",
               "manual = constant gain", table_key=True)
     pol_var, pol_box = add_combo(ant_f, "Polarisation", POL_OPTIONS, "H")
     r_az = add_entry(ant_f, "ant_az", "Pointing azimuth (deg)", "30")
@@ -2567,7 +3055,7 @@ def build_gui():
     rows[ant_f] += 1
 
     # ---- target ----
-    add_entry(tgt_f, "rcs", "RCS (m^2)", "1", "from aspect + pol",
+    add_entry(tgt_f, "rcs", "RCS (m^2)", "0.1", "from aspect + pol",
               table_key=True)
     r_rng = add_entry(tgt_f, "tgt_range", "Range (km)", "30")
     add_slider(tgt_f, "tgt_range", r_rng, 0.1, 200)
@@ -2603,7 +3091,7 @@ def build_gui():
     for key, label, default, typical in RAIN_FIELDS:
         add_entry(loss_f, key, label, default, f"typ. {typical}")
 
-    loss_keys = [k for k, *_ in LOSS_FIELDS] + [a_key]
+    loss_keys = [k for k, *_ in LOSS_FIELDS] + [a_key, NF_FIELD[0]]
     table_keys = ["gain", "rcs"] + loss_keys
 
     # ---- helpers ----
@@ -2664,8 +3152,9 @@ def build_gui():
             available = TABLE_NAME.get(key, key) in state["tables"]
             if available:
                 table_checks[key].state(["!disabled"])
-                if first_time:
-                    table_flags[key].set(True)
+                if first_time and not state["tables"][
+                        TABLE_NAME.get(key, key)].get("dummy"):
+                    table_flags[key].set(True)   # DUMMY tables stay opt-in
             else:
                 table_flags[key].set(False)
                 table_checks[key].state(["disabled"])
@@ -2743,7 +3232,36 @@ def build_gui():
             for key in ("prf", "fft", shown):
                 set_quiet(key, "-")
 
-    saved_cpi = {"cpi": "10", "npulse": "100"}
+    def update_pw_duty(*_):
+        """PW = DC x PRI (Duty cycle mode) or DC = PW / PRI (PW mode).
+        With a PRI list (PRI Switcher) the shortest PRI is used."""
+        if state["suppress"]:
+            return
+        by_duty = pw_mode_var.get() == "Duty cycle"
+        shown = "pw" if by_duty else "duty"          # the computed entry
+        try:
+            switch = pri_mode_var.get() == "PRI Switcher"
+            pri = min(parse_list("pri") if switch else [parse("pri")])
+            if pri <= 0:
+                raise ValueError("PRI must be positive.")
+            if by_duty:
+                dc = parse("duty")
+                if not 0 < dc <= 100:
+                    raise ValueError("Duty cycle must be in (0, 100] %.")
+                set_quiet("pw", f"{dc / 100.0 * pri:.6g}")
+            else:
+                set_quiet("duty", f"{parse('pw') / pri * 100.0:.6g}")
+        except ValueError:
+            set_quiet(shown, "-")
+
+    def on_pw_mode_change(*_):
+        by_duty = pw_mode_var.get() == "Duty cycle"
+        entries["pw"].state(["disabled"] if by_duty else ["!disabled"])
+        entries["duty"].state(["!disabled"] if by_duty else ["disabled"])
+        update_pw_duty()
+        schedule()
+
+    saved_cpi = {"cpi": "10", "npulse": "32"}
     cpi_cur = {"mode": "CPI time"}
 
     def on_cpi_mode_change(*_):
@@ -2759,7 +3277,7 @@ def build_gui():
         update_derived()
         schedule()
 
-    saved_pri = {"PRI Stable": "100", "PRI Switcher": PRI_LIST_DEFAULT}
+    saved_pri = {"PRI Stable": "250", "PRI Switcher": PRI_LIST_DEFAULT}
     pri_cur = {"mode": "PRI Stable"}
 
     def on_pri_mode_change(*_):
@@ -2776,6 +3294,7 @@ def build_gui():
             labels["npulse"].config(text="Pulses per CPI (N)")
         set_quiet("pri", saved_pri[new])
         update_derived()
+        update_pw_duty()
         schedule()
 
     def show(msg, status=None):
@@ -2796,7 +3315,7 @@ def build_gui():
             "pri_list": parse_list("pri") if switch else [parse("pri")],
             "mop": mop,
             "mop_param": None if mop == "None" else parse("mop_param"),
-            "bw": parse("bw"), "freq": parse("freq"), "nf": parse("nf"),
+            "bw": parse("bw"), "freq": parse("freq"),
             "snr": parse("snr"), "temp": parse("temp"), "cpi": None if count else parse("cpi"),
             "n_pulses": parse_int("npulse") if count else None,
             "pol": POL_CODE[pol_var.get()],
@@ -2867,6 +3386,9 @@ def build_gui():
     cpi_mode_box.bind("<<ComboboxSelected>>", on_cpi_mode_change)
     for key in ("pri", "cpi", "npulse"):
         vars_[key].trace_add("write", update_derived)
+    for key in ("pri", "pw", "duty"):
+        vars_[key].trace_add("write", update_pw_duty)
+    pw_mode_box.bind("<<ComboboxSelected>>", on_pw_mode_change)
     pol_box.bind("<<ComboboxSelected>>", schedule)
     vars_["pw"].trace_add("write", update_suggested)
     vars_["mop_param"].trace_add("write", update_suggested)
@@ -2876,6 +3398,7 @@ def build_gui():
 
     on_mop_change()
     on_cpi_mode_change()
+    on_pw_mode_change()
     apply_table_availability(first_time=True)
     calculate()
     return root

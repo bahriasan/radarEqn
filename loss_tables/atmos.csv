@@ -1,33 +1,51 @@
-# Clear-air atmospheric attenuation, ONE-WAY, dB/km
-# Sea level, standard atmosphere (7.5 g/m^3 water vapour)
-# Approximate values read from ITU-R P.676 curves (+/-20%).
-# Replace with your own data if you need better accuracy.
+# Clear-air gaseous attenuation, ONE-WAY, dB/km (oxygen + water vapour)
+# Computed with ITU-Rpy 0.4.0 (itur.models.itu676 gamma0_exact + gammaw_exact),
+# which implements Recommendation ITU-R P.676-12 line-by-line.
+# Reference atmosphere: 1013.25 hPa, 15 C (288.15 K), 7.5 g/m^3 water vapour.
+# Gaseous attenuation does not depend on polarisation.
 freq_ghz,db_per_km
-1,0.0054
-2,0.0064
-3,0.0071
-4,0.0077
-5,0.0084
-6,0.0091
-8,0.0108
-10,0.0132
-12,0.017
-14,0.023
-16,0.033
-18,0.056
-20,0.1
-22.2,0.18
-24,0.16
-26,0.13
-30,0.11
-35,0.12
-40,0.15
-45,0.25
-50,0.5
-55,3.0
-60,15.0
-65,2.0
-70,0.5
-80,0.3
-94,0.4
-100,0.45
+1,0.00544
+2,0.00692
+3,0.00754
+4,0.00809
+5,0.00871
+6,0.00946
+7,0.01035
+8,0.01142
+9,0.01268
+10,0.0142
+11,0.01602
+12,0.01823
+13,0.02098
+14,0.02447
+15,0.02906
+16,0.03532
+17,0.04423
+18,0.05751
+19,0.07792
+20,0.10893
+21,0.15043
+22,0.18734
+22.235,0.19227
+23,0.19429
+24,0.17316
+25,0.14623
+26,0.12503
+27,0.11074
+28,0.10176
+29,0.09649
+30,0.09382
+31,0.09302
+32,0.09362
+33,0.09533
+34,0.09798
+35,0.10146
+36,0.10572
+37,0.11076
+38,0.11662
+39,0.12335
+40,0.13109
+50,0.38843
+60,14.7783
+80,0.34237
+100,0.45806
