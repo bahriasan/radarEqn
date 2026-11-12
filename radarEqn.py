@@ -2009,7 +2009,7 @@ def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
     ks = list(range(nfft))
     if nfft > 64:                                 # draw only the neighbours
         centre = int(round((f_app % prf) / prf * nfft)) % nfft
-        ks = sorted({(centre + o) % nfft for o in range(-4, 5)})
+        ks = sorted({(centre + o) % nfft for o in range(-8, 9)})
     bank = []
     for k in ks:
         h = np.roll(wmag, k * (m // nfft))        # filter centred at k*PRF/nfft
@@ -2028,7 +2028,18 @@ def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
             np.abs(np.fft.fft(w * x, size)) ** 2 / sw2, 1e-12))
 
     bins_total = spec(clean + noise, nfft)
+    # every PRI dwell folds the true Doppler into its own +-PRF/2; combining
+    # the dwells (PRI Switcher) recovers it inside +-1/(2 GCD(PRI))
+    f_true = res["f_dop_hz"]
+    span = res["dop_span_hz"]
+    dwells = [{"pri_us": dw["pri_us"], "prf": dw["prf_hz"],
+               "f_app": dw["dop_app_hz"], "detected": dw["detected"],
+               "why": dw["why"]} for dw in res["dwells"]]
     return {
+        "multi": res["pri_mode"] == "switch", "dwells": dwells,
+        "lim_pri_us": d["pri_us"], "span": span,
+        "f_resolved": (f_true + span / 2.0) % span - span / 2.0,
+        "f_found": res["meas"]["dop_hz"], "found_state": res["meas"]["dop_state"],
         "window": window, "n": n, "prf": prf, "nfft": nfft, "freq": freq,
         "bank": np.array(bank), "centres": centres,
         "fine_clean": np.fft.fftshift(spec(clean, m)),
@@ -2043,8 +2054,9 @@ def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
     }
 
 
-def draw_doppler(fig, res, sim):
-    """Doppler filter bank (top) and target Doppler line (bottom)."""
+def draw_doppler(fig, res, sim, zoom=True):
+    """Doppler filter bank (top) and target Doppler line (bottom).
+    zoom: limit the filter bank plot to a few bins around the target."""
     fig.clear()
     ax1, ax2 = fig.subplots(2, 1, gridspec_kw={"height_ratios": [1, 1.2]})
     lam, prf = sim["wavelength"], sim["prf"]
@@ -2062,10 +2074,12 @@ def draw_doppler(fig, res, sim):
                 label=f"target line {sim['f_app']:+,.0f} Hz")
     ax1.set_ylim(-60, 3)
     ax1.set_ylabel("filter response (dB)", fontsize=8)
-    shown = "all" if len(sim["bank"]) == sim["nfft"] else "nearest 9"
+    shown = ("all" if len(sim["bank"]) == sim["nfft"]
+             else f"nearest {len(sim['bank'])}")
     ax1.set_title(
         f"Doppler filter bank: {sim['nfft']} filters ({shown} drawn), "
-        f"{sim['window']} window\n"
+        f"{sim['window']} window"
+        f"{', zoomed' if zoom else ''}\n"
         f"spacing {prf / sim['nfft']:.1f} Hz, resolution "
         f"{sim['df_res']:.1f} Hz = {sim['dv_res']:.2f} m/s",
         fontsize=9, pad=34)
@@ -2087,10 +2101,29 @@ def draw_doppler(fig, res, sim):
     ax2.set_ylabel("power re noise (dB)", fontsize=8)
     ax2.set_xlabel("Doppler (Hz)", fontsize=8)
     v_true = sim["f_true"] * lam / 2
-    note = (f"ALIASED: true {sim['f_true']:+,.0f} Hz ({v_true:+.1f} m/s) "
-            f"folds to {sim['f_app']:+,.0f} Hz" if sim["aliased"]
-            else f"true Doppler {sim['f_true']:+,.0f} Hz ({v_true:+.1f} m/s), "
-                 "inside +-PRF/2")
+    dwell_tag = f"this dwell (PRI {sim['lim_pri_us']:g} us): " \
+        if sim["multi"] else ""
+    note = (f"{dwell_tag}ALIASED: true {sim['f_true']:+,.0f} Hz "
+            f"({v_true:+.1f} m/s) folds to {sim['f_app']:+,.0f} Hz"
+            if sim["aliased"]
+            else f"{dwell_tag}true Doppler {sim['f_true']:+,.0f} Hz "
+                 f"({v_true:+.1f} m/s), inside +-PRF/2")
+    if sim["multi"]:
+        folds = ", ".join(
+            f"{dw['f_app']:+,.0f}" + ("" if dw["detected"] else "*")
+            for dw in sim["dwells"])
+        v_res = sim["f_resolved"] * lam / 2
+        if sim["f_found"] is not None and sim["found_state"] == "resolved":
+            verdict = "resolved across dwells"
+        elif sim["f_found"] is None:
+            verdict = "would resolve to (NOT DETECTED)"
+        else:
+            verdict = f"across dwells ({sim['found_state']})"
+        note += (f"\nper dwell [Hz]: {folds}  ->  {verdict}: "
+                 f"{sim['f_resolved']:+,.0f} Hz ({v_res:+.1f} m/s), "
+                 f"span +-{sim['span'] / 2:,.0f} Hz")
+        if any(not dw["detected"] for dw in sim["dwells"]):
+            note += "   (* = not detected in that dwell)"
     budget_loss = next((v for name, v, _n in res["budget"]
                         if name.startswith("Doppler window")), None)
     loss_txt = (f"; window loss {sim['pl_db']:.2f} dB here vs "
@@ -2106,6 +2139,12 @@ def draw_doppler(fig, res, sim):
         ax.set_xlim(-half, half)
         ax.tick_params(labelsize=7)
         ax.grid(alpha=0.25)
+    if zoom:                                       # +-6 bins around target
+        w6 = 6 * prf / sim["nfft"]
+        lo = max(-half, sim["f_app"] - w6)
+        hi = min(half, sim["f_app"] + w6)
+        ax1.set_xlim(lo, hi)
+        ax2.axvspan(lo, hi, color="#c0392b", alpha=0.06, lw=0)
     sec = ax1.secondary_xaxis(
         "top", functions=(lambda x: x * lam / 2, lambda v: v * 2 / lam))
     sec.set_xlabel("radial velocity (m/s)", fontsize=8)
@@ -2647,6 +2686,7 @@ def build_gui():
     mf = {"fig": None, "canvas": None, "res": None, "seed": 1}
     mf_mode = tk.StringVar(value="single")
     mf_win = tk.StringVar(value="Hamming")
+    mf_zoom = tk.BooleanVar(value=True)
 
     def redraw_mf(*_):
         if mf["fig"] is None or mf["res"] is None:
@@ -2657,7 +2697,7 @@ def build_gui():
             if mf_mode.get() == "doppler":
                 sim = simulate_doppler(mf["res"], mf_win.get(),
                                        seed=mf["seed"])
-                draw_doppler(mf["fig"], mf["res"], sim)
+                draw_doppler(mf["fig"], mf["res"], sim, zoom=mf_zoom.get())
             else:
                 sim = simulate_mf(mf["res"],
                                   integrated=mf_mode.get() == "integrated",
@@ -2690,6 +2730,8 @@ def build_gui():
                                state="readonly", values=DOPPLER_WINDOWS)
         win_box.pack(side="left", padx=(4, 0))
         win_box.bind("<<ComboboxSelected>>", redraw_mf)
+        ttk.Checkbutton(ctrl, text="Zoom on target", variable=mf_zoom,
+                        command=redraw_mf).pack(side="left", padx=(8, 0))
         ttk.Button(ctrl, text="New noise", command=new_noise).pack(
             side="left", padx=(16, 0))
         mf["fig"] = Figure(figsize=(7, 7), dpi=100)
@@ -3032,8 +3074,10 @@ def build_gui():
     add_entry(radar_f, "cpi", "CPI (ms)", "10")
     add_entry(radar_f, "npulse", "Pulses per CPI (N)", "32")
     add_entry(radar_f, "fft", "FFT points (auto, 2^k >= N)", "")
+    add_entry(radar_f, "illum", "Illumination time (ms, auto)", "")
     entries["prf"].state(["disabled"])
     entries["fft"].state(["disabled"])
+    entries["illum"].state(["disabled"])
     entries["duty"].state(["disabled"])
 
     # ---- antenna ----
@@ -3219,17 +3263,22 @@ def build_gui():
             if count:
                 n = parse_int("npulse")
                 ns = [n] * len(pris)
-                set_quiet("cpi", spread([n * p / 1000.0 for p in pris], "{:.4g}"))
+                cpis = [n * p / 1000.0 for p in pris]
+                set_quiet("cpi", spread(cpis, "{:.4g}"))
             else:
                 cpi = parse("cpi")
+                cpis = [cpi] * len(pris)
                 ns = [math.floor(cpi * 1000.0 / p + 1e-9) for p in pris]
                 set_quiet("npulse", spread(ns, "{:d}") if min(ns) >= 1
                           else "< 1 (CPI shorter than PRI)")
             if min(ns) < 1:
                 raise ValueError("no pulse in CPI")
             set_quiet("fft", ", ".join(str(fft_size(n)) for n in ns))
+            # Illumination time: one CPI (PRI Stable) or the sum of the
+            # CPIs of all PRIs in the switch sequence (PRI Switcher).
+            set_quiet("illum", f"{sum(cpis):.4g}")
         except ValueError:
-            for key in ("prf", "fft", shown):
+            for key in ("prf", "fft", "illum", shown):
                 set_quiet(key, "-")
 
     def update_pw_duty(*_):
