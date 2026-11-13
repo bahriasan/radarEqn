@@ -90,6 +90,23 @@ current inputs and tables and updates live:
 Lobes are shown on a dB scale (antenna 40 dB, RCS 30 dB span) and are not to
 scale in range. With manual gain / RCS there is no pattern, so none is drawn.
 
+Signal chain / phase noise (inputs: "Transmitter" section, results:
+"Signal chain" tab). Oscillators are given by their full L(f) (datasheet
+points, osc_structure); amplifier / magnetron / COHO terms see PhaseChain.
+-----------------------------------------------
+Transmitter type: coherent (source oscillator -> optional SSPA / TWT /
+Klystron / CFA, RX LO shared with the source or independent) or magnetron
+(random phase every pulse, COHO locked to each pulse, STALO). Every block
+adds an independent phase process to the slow-time samples (see
+PhaseChain): shared-oscillator noise cancels at short range (range
+correlation), amplifier / COHO jitter and independent LOs do not. The
+magnetron pulse-to-pulse frequency jitter does NOT grow with range: the echo
+carries the magnetron phase it was locked to, only the slope across the
+pulse remains (pi df PW, COHO locked at the leading edge). Results: the
+coherent loss of the target (in the loss budget, range dependent in the
+detection range), the Doppler phase-noise floor (dBc, clutter limit) and
+the Doppler line width.
+
 Matched filter view (optional, needs numpy + matplotlib)
 --------------------------------------------------------
 Uses only the defined waveform: PW, MOP (None / LFM chirp bandwidth /
@@ -114,6 +131,7 @@ try:
     from matplotlib.backends.backend_tkagg import (
         FigureCanvasTkAgg, NavigationToolbar2Tk)
     HAVE_PLOT = True
+    _trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
 except ImportError:          # the calculator works without the plot
     HAVE_PLOT = False
 
@@ -832,14 +850,671 @@ def doppler_metrics(n, pri_s, wavelength, snr_tgt_db, snr_req_db):
     return out
 
 
+# =================================================================
+# SIGNAL CHAIN: transmitter source / amplifier / RX LO phase noise
+# =================================================================
+
+CHAIN_TYPES = {"coherent": "Coherent (source + amplifier)",
+               "magnetron": "Magnetron (coherent on receive)"}
+# amplifier: (phase pushing deg per 1 % supply change, supply pulse-to-pulse
+# jitter % rms, additive pulse-to-pulse phase jitter deg rms).
+# ROUGH starting values only - replace them with the tube / module data.
+AMP_TYPES = {
+    "None (source direct)": (0.0, 0.0, 0.0),
+    "SSPA": (2.0, 0.05, 0.2),
+    "TWT": (30.0, 0.02, 0.2),
+    "Klystron": (15.0, 0.02, 0.2),
+    "CFA": (2.0, 0.1, 0.5),
+}
+RX_LO_TYPES = {"shared": "Shared with source (same oscillator)",
+               "independent": "Independent oscillator"}
+# Oscillator phase noise L(f) as "offset kHz : dBc/Hz" points (datasheet
+# style, SSB). ROUGH typical curves - replace them with your datasheets.
+# RF oscillators referred to an X / Ku band carrier, COHO at IF (tens of MHz).
+OSC_PRESETS = {
+    "Low-noise STALO (multiplied crystal)":
+        "0.1:-70, 1:-100, 10:-120, 100:-130, 1000:-140, 10000:-150",
+    "Typical PLL synthesizer":
+        "0.1:-60, 1:-85, 10:-95, 100:-100, 1000:-125, 10000:-145",
+    "Free-running DRO":
+        "1:-60, 10:-90, 100:-115, 1000:-135, 10000:-150",
+}
+COHO_PRESETS = {
+    "Crystal COHO": "0.1:-100, 1:-125, 10:-145, 100:-155, 1000:-160",
+    "LC COHO": "0.1:-70, 1:-95, 10:-115, 100:-135, 1000:-150",
+}
+CUSTOM = "Custom"
+CHAIN_DEFAULT = {
+    "type": "coherent",
+    # source (coherent) or STALO (magnetron): phase noise L(f) points
+    "src_pn": OSC_PRESETS["Typical PLL synthesizer"],
+    "amp": "None (source direct)",
+    "amp_push": 0.0, "amp_supply": 0.0, "amp_add": 0.0,
+    "rx_lo": "shared",
+    "lo_pn": OSC_PRESETS["Typical PLL synthesizer"],
+    # magnetron: pulse-to-pulse carrier offset (rms) and intrapulse linear
+    # frequency change end - start (rms over pulses), both in kHz
+    "mag_fjit_khz": 1.0, "mag_chirp_khz": 5.0,
+    # coherent-on-receive reference: "analog" COHO, "digital" (TX burst
+    # sampled by the ADC, digital COHO) or "none"
+    "coho_mode": "analog", "coho": True,
+    # analog COHO: lock point, lock residual, IF oscillator phase noise
+    "lock_point": "edge", "mag_lock": 3.0,
+    "coho_pn": COHO_PRESETS["Crystal COHO"],
+    # digital COHO: correction type, phase measurement error, phase memory
+    "dig_corr": "replica", "dig_err": 1.0, "dig_memory": True,
+}
+COHO_MODES = {"analog": "Analog COHO", "digital": "Digital COHO",
+              "none": "No COHO"}
+LOCK_POINTS = {"edge": "Leading edge", "centre": "Pulse centre"}
+DIG_CORR = {"replica": "TX replica MF", "phase": "Avg. phase only"}
+UNI_KINDS = ("uniform", "trip")      # kinds that can destroy coherence
+
+
+class OscPN:
+    """Oscillator SSB phase noise L(f) from datasheet points, interpolated
+    linearly in dB vs log offset. Below the first point the first segment
+    slope is continued (clamped to -40..0 dB/decade), above the last point
+    the curve stays flat (white PM floor). S_phi(f) = 2 L(f) rad^2/Hz
+    (one-sided, small angle)."""
+
+    def __init__(self, text, name="oscillator"):
+        self.text = text
+        self.name = name
+        pts = OscPN.parse(text, name)
+        self.f_hz = [p[0] * 1e3 for p in pts]
+        self.l_db = [p[1] for p in pts]
+        lf = [math.log10(f) for f in self.f_hz]
+        slope = (self.l_db[1] - self.l_db[0]) / (lf[1] - lf[0])
+        self.slope0 = min(0.0, max(-40.0, slope))
+        self._lf = lf
+
+    @staticmethod
+    def parse(text, name="oscillator"):
+        """'0.1:-70, 1:-100, ...' -> [(kHz, dBc/Hz), ...] (validated)."""
+        pts = []
+        for item in str(text).replace(";", ",").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                f, l = (float(v) for v in item.split(":"))
+            except ValueError:
+                raise ValueError(f"{name} phase noise: '{item}' is not "
+                                 "'offset_kHz:dBc/Hz'.") from None
+            if f <= 0 or not math.isfinite(f) or not math.isfinite(l):
+                raise ValueError(f"{name} phase noise: offset must be > 0.")
+            if l >= 0:
+                raise ValueError(f"{name} phase noise: L must be < 0 dBc/Hz.")
+            pts.append((f, l))
+        pts.sort()
+        if len(pts) < 2:
+            raise ValueError(f"{name} phase noise: give at least 2 points "
+                             "(offset_kHz:dBc/Hz, ...).")
+        if any(pts[i][0] == pts[i + 1][0] for i in range(len(pts) - 1)):
+            raise ValueError(f"{name} phase noise: duplicate offsets.")
+        return pts
+
+    def l_dbc(self, f):
+        """L(f) in dBc/Hz (numpy array or float)."""
+        if HAVE_PLOT:
+            x = np.log10(np.maximum(np.asarray(f, dtype=float), 1e-9))
+            y = np.interp(x, self._lf, self.l_db)
+            low = x < self._lf[0]
+            y = np.where(low, self.l_db[0] + self.slope0 * (x - self._lf[0]),
+                         y)
+            return y
+        x = math.log10(max(f, 1e-9))
+        if x <= self._lf[0]:
+            return self.l_db[0] + self.slope0 * (x - self._lf[0])
+        for i in range(len(self._lf) - 1):
+            if x <= self._lf[i + 1]:
+                a = (x - self._lf[i]) / (self._lf[i + 1] - self._lf[i])
+                return self.l_db[i] + a * (self.l_db[i + 1] - self.l_db[i])
+        return self.l_db[-1]
+
+    def s_phi(self, f):
+        return 2.0 * 10 ** (self.l_dbc(f) / 10.0)
+
+    def short(self, per_line=3):
+        """Compact text of the points: '1k -85  10k -95 ...'."""
+        def fk(f):
+            k = f / 1e3
+            return (f"{k/1e3:g}M" if k >= 1000 else
+                    f"{k:g}k" if k >= 1 else f"{f:g}Hz")
+        items = [f"{fk(f)} {l:g}" for f, l in zip(self.f_hz, self.l_db)]
+        return "\n".join("  ".join(items[i:i + per_line])
+                         for i in range(0, len(items), per_line))
+
+
+def mismatch_stats(s):
+    """Matched filter amplitude a = sinc(x) of a pulse whose carrier is off
+    by x = df PW cycles (rect pulse, nominal replica; LFM gives about the
+    same at a fixed range gate through range-Doppler coupling), x Gaussian
+    with rms s: returns (E[a], E[a^2])."""
+    if s <= 0:
+        return 1.0, 1.0
+    m = q = wsum = 0.0
+    k = 1601
+    for i in range(k):
+        x = (-8 + 16 * i / (k - 1)) * s
+        w = math.exp(-0.5 * (x / s) ** 2)
+        a = 1.0 if x == 0 else math.sin(math.pi * x) / (math.pi * x)
+        m += w * a
+        q += w * a * a
+        wsum += w
+    return m / wsum, q / wsum
+
+
+def magnetron_jitter_from_stability(stab, f0_hz, pw_s, ripple_hz,
+                                    kind="peak"):
+    """Magnetron P2P and intrapulse frequency jitter (kHz rms) from a
+    fractional frequency stability figure (e.g. 7e-7, measured with a
+    frequency discriminator), assuming the instability is a sinusoidal
+    ripple of the supply (pushing) at ripple_hz, not synchronous with the
+    PRF (random ripple phase at every pulse):
+      f(t) = A sin(2 pi fr t + theta),  A = stab f0 (peak) or
+                                        A = sqrt(2) stab f0 (if rms)
+      P2P (pulse to pulse carrier)    : A / sqrt(2) rms
+      intrapulse change end - start   : 2 A sin(pi fr PW) cos(...)
+                                        -> sqrt(2) A |sin(pi fr PW)| rms
+    Returns (p2p_khz, intra_khz, a_hz, fr_pw)."""
+    a = stab * f0_hz * (math.sqrt(2) if kind == "rms" else 1.0)
+    p2p = a / math.sqrt(2)
+    intra = math.sqrt(2) * a * abs(math.sin(math.pi * ripple_hz * pw_s))
+    return p2p / 1e3, intra / 1e3, a, ripple_hz * pw_s
+
+
+def osc_structure(curves, n, T, tau, pw, form):
+    """Phase structure function D(L) = Var(phi_k+L - phi_k), L = 0..n-1, of
+    the slow-time phase produced by oscillator phase noise (numpy array).
+
+    phi_k is the matched-filter (pulse-averaged, |H|^2 = sinc^2(f PW))
+    phase of pulse k:
+      form 'shared'  same oscillator at TX and RX (or a COHO re-locked at
+                     TX and used at the echo): theta(t) - theta(t + tau)
+                     -> S_x = S_phi 4 sin^2(pi f tau)   (range correlation)
+      form 'indep'   independent TX / RX oscillators: S_x = S_tx + S_rx
+    D(L) = 2 int S_x(f) (1 - cos 2 pi f L T) df. Offsets below 8 PRF are
+    folded exactly into the PRF band (FFT), higher offsets alias as white
+    slow-time noise. Offsets below PRF / (bins per PRF) (drift slower than
+    the CPI = a Doppler shift) are ignored."""
+    def s_x(f):
+        s = sum(c.s_phi(f) for c in curves)
+        if pw > 0:
+            s = s * np.sinc(f * pw) ** 2
+        return s
+
+    mb = 1 << int(math.ceil(math.log2(max(8 * n, 32 * tau / T + 1, 64))))
+    prf = 1.0 / T
+    df = prf / mb
+    h = 8
+    idx = np.arange(1, h * mb)
+    f = idx * df
+    g = s_x(f)
+    if form == "shared":
+        g = g * 4 * np.sin(np.pi * f * tau) ** 2
+    sf = np.bincount(idx % mb, weights=g * df, minlength=mb)
+    d = 2 * (sf.sum() - np.real(np.fft.fft(sf))[:n])
+    # above 8 PRF: white in slow time
+    fh = h * prf
+    fmax = max(50.0 / pw if pw > 0 else 1e9, 10 * fh)
+    v = 0.0
+    start = fh
+    if form == "shared" and tau > 0 and 10 / tau > fh:
+        stop = min(10 / tau, fmax)
+        step = max(1 / (16 * tau), (stop - fh) / 4000)
+        f1 = np.arange(fh, stop, step)
+        if len(f1) > 1:
+            v += _trapz(s_x(f1) * 4 * np.sin(np.pi * f1 * tau) ** 2, f1)
+        start = stop
+    if fmax > start:
+        f2 = np.geomspace(start, fmax, 1500)
+        v += _trapz(s_x(f2) * (2.0 if form == "shared" else 1.0), f2)
+    d[1:] += 2 * v
+    d[0] = 0.0
+    return np.maximum(d, 0.0)
+
+
+def osc_structure_py(curves, n, T, tau, pw, form):
+    """Pure python fallback of osc_structure (log grid, no folding)."""
+    fs = [10 ** (k / 40.0) for k in range(-40, 400)]       # 0.1 Hz..10 GHz
+    out = [0.0] * n
+    for i in range(1, len(fs)):
+        f, dfi = fs[i], fs[i] - fs[i - 1]
+        s = sum(c.s_phi(f) for c in curves)
+        if pw > 0:
+            x = math.pi * f * pw
+            s *= (math.sin(x) / x) ** 2
+        if form == "shared":
+            s *= 4 * math.sin(math.pi * f * tau) ** 2
+        for lag in range(1, n):
+            out[lag] += 2 * s * (1 - math.cos(2 * math.pi * f * lag * T)) * dfi
+    return out
+
+
+class PhaseChain:
+    """
+    Phase error of the slow-time samples (one per pulse, at the target range
+    gate after down-conversion and matched filtering), built from the
+    blocks of the signal chain. Every block adds an independent phase
+    process; the sum is phi_k and c(L) = E[exp(j(phi_k - phi_{k+L}))] =
+    prod over blocks of exp(-D_b(L)/2), D_b(L) = Var(phi_k - phi_{k+L}).
+
+    Block kinds (T = PRI, tau = 2R/c, L = pulse lag):
+      osc_shared  oscillator phase noise L(f) (datasheet points), same
+                  oscillator at TX and RX (coherent source with shared LO,
+                  STALO) or a COHO re-locked every pulse and used at the
+                  echo: theta(t) - theta(t + tau) -> range correlation
+      osc_indep   independent TX and RX oscillators: range independent
+                  (both via osc_structure: full L(f), pulse averaging by
+                  the matched filter, aliasing into the PRF band)
+      white       independent phase every pulse, variance p:
+                  D(L) = 2 p  (L > 0)             -> range independent
+      uniform     random start phase each pulse (magnetron without COHO):
+                  c(L) = 0 for L > 0              -> no coherent gain
+      trip        magnetron + COHO, echo beyond the first trip (tau >= T):
+                  the COHO has been re-locked to a later pulse with an
+                  unrelated random phase -> like uniform (second-trip
+                  echoes are incoherent), no effect for tau < T
+
+    Amplifier: sigma = sqrt((pushing x supply jitter)^2 + additive^2).
+    Magnetron + COHO: the COHO is phase locked to each transmitted pulse,
+    leaving the lock residual. The pulse-to-pulse magnetron frequency error
+    df does NOT accumulate over the round trip: the echo is the magnetron
+    signal delayed by tau, so its phase at the echo centre equals the
+    transmitted phase the COHO was locked to; the difference only builds up
+    in the STALO / COHO over tau. What remains is the phase slope across
+    the pulse: the matched filter averages the echo phase over the pulse
+    (centre), the COHO is locked near the leading edge -> phase error
+    pi df PW (Radar Handbook instability table), white, range independent.
+    (Checked with a fast-time simulation: edge lock 1.72 deg vs pi df PW =
+    1.8 deg for df = 1 kHz, PW = 10 us; centre lock ~0.) The intrapulse
+    linear frequency change and the analog / digital COHO variants are in
+    mag_terms(). Digital COHO: the TX burst is sampled by the receiver ADC
+    every pulse (digital coherent-on-receive / burst pulse analysis); the
+    echo is corrected with the measured phase or matched to the sampled TX
+    pulse itself; with phase memory second-trip echoes stay coherent.
+    """
+
+    def __init__(self, spec, b_hz):
+        sp = dict(CHAIN_DEFAULT)
+        sp.update(spec or {})
+        self.spec = sp
+        self.b_hz = b_hz
+        self.mag = sp["type"] == "magnetron"
+        self._dcache = {}
+        pw = sp.get("pw_s") or 0.0
+
+        src = "STALO" if self.mag else "Source"
+        self.src_pn = OscPN(sp["src_pn"], src)
+        self.lo_pn = None
+        self.coho_pn = None
+        comps = []
+        if self.mag or sp["rx_lo"] == "shared":
+            comps.append((f"{src} phase noise (shared, range-correlated)",
+                          "osc_shared", ((self.src_pn,), pw)))
+        else:
+            self.lo_pn = OscPN(sp["lo_pn"], "RX LO")
+            comps.append(("Source phase noise (TX, independent of RX)",
+                          "osc_indep", ((self.src_pn,), pw)))
+            comps.append(("RX LO phase noise (independent)",
+                          "osc_indep", ((self.lo_pn,), pw)))
+        if self.mag:
+            mode = sp.get("coho_mode") or ("analog" if sp["coho"] else "none")
+            sp["coho_mode"] = mode
+            sp["coho"] = mode != "none"
+            if mode != "none":
+                # phase error of the matched filter output (pulse average)
+                # re the reference phase: p2p offset df -> slope, intrapulse
+                # linear chirp dc (end - start) -> parabola (see mag_terms)
+                e_f, e_c = self.mag_terms()
+                comps.append(("Magnetron P2P freq. jitter", "white",
+                              e_f ** 2))
+                comps.append(("Magnetron intrapulse freq. jitter", "white",
+                              e_c ** 2))
+                # carrier offset df_k vs a nominal replica: MF amplitude
+                # sinc(df PW) varies pulse to pulse (only the TX replica
+                # matched filter is matched to the actual pulse)
+                if not (mode == "digital" and sp["dig_corr"] == "replica"):
+                    comps.append(("Magnetron P2P freq. mismatch (MF ampl.)",
+                                  "amp", mismatch_stats(
+                                      sp["mag_fjit_khz"] * 1e3
+                                      * (sp.get("pw_s") or 0.0))))
+            if mode == "analog":
+                self.coho_pn = OscPN(sp["coho_pn"], "COHO")
+                comps.append(("COHO lock residual", "white",
+                              math.radians(sp["mag_lock"]) ** 2))
+                comps.append(("COHO phase noise (lock -> echo)",
+                              "osc_shared", ((self.coho_pn,), pw)))
+                comps.append(("Second-trip echo (COHO re-locked)", "trip",
+                              0.0))
+            elif mode == "digital":
+                comps.append(("Digital COHO phase measurement error",
+                              "white", math.radians(sp["dig_err"]) ** 2))
+                if not sp["dig_memory"]:
+                    comps.append(("Second-trip echo (no phase memory)",
+                                  "trip", 0.0))
+            else:
+                comps.append(("Magnetron random phase (no COHO)",
+                              "uniform", 0.0))
+        elif sp["amp"] != "None (source direct)":
+            sig = math.hypot(sp["amp_push"] * sp["amp_supply"], sp["amp_add"])
+            comps.append((f"{sp['amp']} pulse-to-pulse phase", "white",
+                          math.radians(sig) ** 2))
+        self.comps = comps
+        self.ideal = all(self._pzero(k, p) for _n, k, p in comps)
+
+    @staticmethod
+    def _pzero(kind, p):
+        if kind in UNI_KINDS:
+            return False
+        if kind in ("osc_shared", "osc_indep"):
+            return False
+        if kind == "amp":
+            return abs(p[0] - 1) < 1e-12 and abs(p[1] - 1) < 1e-12
+        return p == 0
+
+    @staticmethod
+    def _amp_factors(comps):
+        """(E[a^2], E[a]^2) product of the amplitude components: the
+        correlation of the pulse gains a_k at lag 0 and at lag > 0."""
+        c0 = c1 = 1.0
+        for _n, kind, p in comps:
+            if kind == "amp":
+                c0 *= p[1]
+                c1 *= p[0] ** 2
+        return c0, c1
+
+    @staticmethod
+    def _uni(comps, T, tau):
+        """True if a component destroys the pulse-to-pulse coherence."""
+        return any(k == "uniform" or (k == "trip" and tau >= T)
+                   for _n, k, _p in comps)
+
+    def _zero(self, comps, T, tau):
+        """True if the components add no phase error at this range."""
+        return (not self._uni(comps, T, tau)
+                and all(k == "trip" or self._pzero(k, p)
+                        for _n, k, p in comps))
+
+    def oscillators(self):
+        """(label, OscPN) of the oscillators in the chain."""
+        out = [("STALO" if self.mag else "Source", self.src_pn)]
+        if self.lo_pn is not None:
+            out.append(("RX LO", self.lo_pn))
+        if self.coho_pn is not None:
+            out.append(("COHO (IF)", self.coho_pn))
+        return out
+
+    def mag_terms(self):
+        """rms phase error (rad) of the matched filter output caused by the
+        magnetron pulse-to-pulse frequency offset (sigma_f) and the
+        intrapulse linear frequency change (sigma_c, end - start), for the
+        selected reference. With s the time from the pulse centre, the echo
+        phase re the reference is 2 pi df (s - sL) + pi dc/PW (s^2 - sL^2);
+        its pulse average is -2 pi df sL + pi dc/PW (PW^2/12 - sL^2):
+          lock at the leading edge (sL = -PW/2): pi sf PW, pi sc PW / 6
+          lock at the centre / pulse-average phase: 0,  pi sc PW / 12
+          digital TX replica matched filter:          0,  0
+        (fast-time check: 1.83 / 3.03 / 1.46 deg vs 1.8 / 3.0 / 1.5)"""
+        sp = self.spec
+        pw = sp.get("pw_s") or 0.0
+        sf = sp["mag_fjit_khz"] * 1e3
+        sc = sp["mag_chirp_khz"] * 1e3
+        mode = sp["coho_mode"]
+        if mode == "digital":
+            if sp["dig_corr"] == "replica":
+                return 0.0, 0.0
+            return 0.0, math.pi * sc * pw / 12
+        if mode == "analog" and sp["lock_point"] == "edge":
+            return math.pi * sf * pw, math.pi * sc * pw / 6
+        return 0.0, math.pi * sc * pw / 12
+
+    def amp_sigma_deg(self):
+        sp = self.spec
+        if self.mag or sp["amp"] == "None (source direct)":
+            return 0.0
+        return math.hypot(sp["amp_push"] * sp["amp_supply"], sp["amp_add"])
+
+    def sigma_y(self, t_s):
+        """Allan deviation of the source / STALO at averaging time t_s,
+        from its L(f) up to the receiver bandwidth."""
+        f0 = self.spec.get("f0_hz")
+        if not f0 or not HAVE_PLOT:
+            return None
+        f = np.geomspace(1e-2, max(self.b_hz, 10.0 / t_s), 4000)
+        x = np.pi * f * t_s
+        sy = (f / f0) ** 2 * self.src_pn.s_phi(f)
+        return math.sqrt(max(2 * _trapz(sy * np.sin(x) ** 4 / x ** 2, f),
+                             0.0))
+
+    def _d_comp(self, comp, n, T, tau):
+        """D(L), L = 0..n-1, of one component (list or numpy array)."""
+        _name, kind, p = comp
+        if kind in ("osc_shared", "osc_indep"):
+            key = (id(comp), n, T, tau)
+            d = self._dcache.get(key)
+            if d is None:
+                curves, pw = p
+                form = "shared" if kind == "osc_shared" else "indep"
+                fn = osc_structure if HAVE_PLOT else osc_structure_py
+                d = fn(curves, n, T, tau, pw, form)
+                if len(self._dcache) > 4000:
+                    self._dcache.clear()
+                self._dcache[key] = d
+            return d
+        if kind == "white":
+            return [0.0] + [2 * p] * (n - 1)
+        return [0.0] * n
+
+    def d_total(self, n, T, tau, comps=None):
+        comps = self.comps if comps is None else comps
+        if HAVE_PLOT:
+            d = np.zeros(n)
+            for c in comps:
+                d += np.asarray(self._d_comp(c, n, T, tau), dtype=float)
+            return d
+        d = [0.0] * n
+        for c in comps:
+            for i, v in enumerate(self._d_comp(c, n, T, tau)):
+                d[i] += v
+        return d
+
+    def dphi_rms(self, T, tau, comps=None):
+        """rms phase difference between consecutive pulses (rad)."""
+        comps = self.comps if comps is None else comps
+        if self._uni(comps, T, tau):
+            return math.pi / math.sqrt(3)      # wrapped uniform difference
+        return math.sqrt(max(float(self.d_total(2, T, tau, comps)[1]), 0.0))
+
+    def corr(self, n, T, tau, comps=None):
+        """c(L), L = 0..n-1 (numpy array)."""
+        comps = self.comps if comps is None else comps
+        c = np.exp(-self.d_total(n, T, tau, comps) / 2)
+        c0, c1 = self._amp_factors(comps)
+        c[0] *= c0
+        c[1:] *= c1
+        if self._uni(comps, T, tau):
+            c[1:] = 0.0
+        return c
+
+    def loss_db(self, n, T, tau, comps=None):
+        """Coherent integration loss of n pulses (uniform weighting):
+        expected power in the target filter / ideal n^2."""
+        comps = self.comps if comps is None else comps
+        if n < 2 or self._zero(comps, T, tau):
+            return 0.0
+        if HAVE_PLOT:
+            c = self.corr(n, T, tau, comps)
+            lags = np.arange(n)
+            g = float(np.sum((n - lags) * np.where(lags == 0, 1, 2) * c))
+        else:                                   # pure python fallback
+            c0, c1 = self._amp_factors(comps)
+            g = float(n) * c0
+            if not self._uni(comps, T, tau):
+                d = self.d_total(n, T, tau, comps)
+                for lag in range(1, n):
+                    g += 2 * (n - lag) * c1 * math.exp(-d[lag] / 2)
+        return -10 * math.log10(max(g / (n * n), 1e-30))
+
+    def phases(self, n, T, tau, rng):
+        """One realisation of phi_0..phi_{n-1} (rad), relative to pulse 0:
+        Gaussian with the covariance given by the structure function,
+        Cov(i, j) = (D(i) + D(j) - D(|i - j|)) / 2."""
+        ph = np.zeros(n)
+        gauss = [c for c in self.comps if c[1] not in UNI_KINDS]
+        d = self.d_total(n, T, tau, gauss)
+        if n > 1 and d.max() > 0:
+            i = np.arange(1, n)
+            cov = (d[i][:, None] + d[i][None, :]
+                   - d[np.abs(i[:, None] - i[None, :])]) / 2
+            try:
+                a = np.linalg.cholesky(cov + 1e-12 * np.eye(n - 1)
+                                       * max(d.max(), 1e-12))
+            except np.linalg.LinAlgError:
+                w, v = np.linalg.eigh(cov)
+                a = v * np.sqrt(np.maximum(w, 0.0))
+            ph[1:] = a @ rng.standard_normal(n - 1)
+        if self._uni(self.comps, T, tau):
+            ph += rng.uniform(0, 2 * math.pi, n)
+        return ph
+
+    def gains(self, n, T, tau, rng):
+        """One realisation of the complex pulse gains a_k exp(j phi_k):
+        phase as phases(), amplitude a_k = sinc(df_k PW) of the magnetron
+        frequency mismatch (independent draw)."""
+        g = np.exp(1j * self.phases(n, T, tau, rng))
+        sp = self.spec
+        for _n, kind, _p in self.comps:
+            if kind == "amp":
+                s = sp["mag_fjit_khz"] * 1e3 * (sp.get("pw_s") or 0.0)
+                g = g * np.sinc(s * rng.standard_normal(n))
+        return g
+
+    def spectrum(self, window, size, T, tau, shift=0.0, comps=None):
+        """Expected filter-output power of a unit tone vs filter frequency
+        (FFT order, `size` points over one PRF) for the weights `window`;
+        the tone is at `shift` x PRF."""
+        n = len(window)
+        rw = np.correlate(window, window, "full")        # lags -(n-1)..n-1
+        lags = np.arange(-(n - 1), n)
+        cl = self.corr(n, T, tau, comps)[np.abs(lags)]
+        seq = np.zeros(size, dtype=complex)
+        np.add.at(seq, lags % size,
+                  rw * cl * np.exp(2j * np.pi * shift * lags))
+        return np.maximum(np.real(np.fft.fft(seq)), 0.0)
+
+    def describe(self):
+        """One line description of the chain."""
+        sp = self.spec
+
+        def osc(pn):
+            return "L(f) " + pn.short(per_line=99) + " (offset dBc/Hz)"
+
+        if self.mag:
+            mode = sp["coho_mode"]
+            if mode == "analog":
+                ref = (f"analog COHO locked at the "
+                       f"{LOCK_POINTS[sp['lock_point']].lower()}, residual "
+                       f"{sp['mag_lock']:g} deg, COHO {osc(self.coho_pn)}")
+            elif mode == "digital":
+                ref = (f"digital COHO ({DIG_CORR[sp['dig_corr']]}, meas. "
+                       f"error {sp['dig_err']:g} deg, phase memory "
+                       + ("on" if sp["dig_memory"] else "off") + ")")
+            else:
+                ref = "NO COHO"
+            return (f"Magnetron (P2P {sp['mag_fjit_khz']:g} kHz rms, "
+                    f"intrapulse {sp['mag_chirp_khz']:g} kHz rms) -> "
+                    f"antenna; {ref}; STALO {osc(self.src_pn)}")
+        rx = ("RX LO = source" if sp["rx_lo"] == "shared" else
+              f"RX LO independent, {osc(self.lo_pn)}")
+        amp = ("" if sp["amp"] == "None (source direct)" else
+               f" -> {sp['amp']} ({self.amp_sigma_deg():.3g} deg rms)")
+        return f"Source {osc(self.src_pn)}{amp} -> antenna; {rx}"
+
+
+def width_3db(spec):
+    """-3 dB width (in bins) of the main lobe at index 0 of a periodic
+    spectrum; returns len(spec) if the whole band is within 3 dB."""
+    half = spec[0] / 2.0
+    size = len(spec)
+    below = spec < half
+    if not below.any():
+        return float(size)
+
+    def edge(step):
+        i = 0
+        while not below[(i + step) % size]:
+            i += step
+        j = (i + step) % size                        # first point below
+        a, b = spec[i % size], spec[j]
+        return abs(i) + (a - half) / (a - b)         # linear interpolation
+
+    return edge(1) + edge(-1)
+
+
+def blackman_harris(n):
+    """4-term Blackman-Harris window (-92 dB sidelobes)."""
+    k = np.arange(n)
+    x = 2 * np.pi * k / max(n - 1, 1)
+    return (0.35875 - 0.48829 * np.cos(x) + 0.14128 * np.cos(2 * x)
+            - 0.01168 * np.cos(3 * x))
+
+
+def doppler_floor_dbc(chain, n, pri_s, tau_s, comps=None):
+    """Phase noise floor of the Doppler spectrum relative to the target
+    peak (dBc): median filter output farther than 8 bins from the line,
+    computed with a -92 dB Blackman-Harris window so that the window
+    sidelobes do not hide it. It is the limit on clutter cancellation /
+    sub-clutter visibility set by the signal chain. None if ideal."""
+    comps = chain.comps if comps is None else comps
+    if n < 8 or not HAVE_PLOT or chain._zero(comps, pri_s, tau_s):
+        return None
+    size = 1 << max(10, (4 * fft_size(n) - 1).bit_length())
+    s = chain.spectrum(blackman_harris(n), size, pri_s, tau_s, comps=comps)
+    guard = int(math.ceil(8 * size / n))
+    far = s[guard:size - guard]
+    if len(far) == 0:
+        return None
+    return 10 * math.log10(max(float(np.median(far)), 1e-30) / s.max())
+
+
+def jitter_metrics(n, pri_s, chain, tau_s):
+    """Phase noise loss, pulse-to-pulse phase error, Doppler noise floor and
+    effective Doppler resolution of one dwell."""
+    out = {"jit_loss_db": 0.0, "jit_res_factor": 1.0, "jit_floor_dbc": None,
+           "jit_dphi": chain.dphi_rms(pri_s, tau_s),
+           "jit_comps": [(c[0], chain.loss_db(n, pri_s, tau_s, [c]),
+                          chain.dphi_rms(pri_s, tau_s, [c]),
+                          doppler_floor_dbc(chain, n, pri_s, tau_s, [c]))
+                         for c in chain.comps]}
+    if chain.ideal or n < 2:
+        return out
+    out["jit_loss_db"] = chain.loss_db(n, pri_s, tau_s)
+    out["jit_floor_dbc"] = doppler_floor_dbc(chain, n, pri_s, tau_s)
+    if HAVE_PLOT:
+        size = 1 << max(12, (16 * fft_size(n) - 1).bit_length())
+        size = min(size, 1 << 20)
+        w = np.ones(n)
+        a = width_3db(chain.spectrum(w, size, pri_s, tau_s, comps=[]))
+        b = width_3db(chain.spectrum(w, size, pri_s, tau_s))
+        out["jit_res_factor"] = b / a
+    return out
+
+
 def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
                freq_ghz, nf_db, snr_db, temp_k, cpi_ms,
                gain_dbi, gain_peak_dbi, rcs_m2, target_km,
                losses, atmos_db_km, rain_db_km=0.0,
                rain_rate=0.0, rain_path_km=0.0,
                sources=None, notes=None, n_pulses=None,
-               speed_ms=0.0, radial_ms=0.0):
+               speed_ms=0.0, radial_ms=0.0, chain=None):
     """
+    chain         : signal chain spec (dict, keys of CHAIN_DEFAULT): source
+                    / amplifier / magnetron / RX LO phase noise; see
+                    PhaseChain. Gives a (possibly range dependent) coherent
+                    integration loss and a wider Doppler line.
     pri_list_us   : one PRI (PRI Stable) or several PRIs (PRI Switcher).
                     Each PRI is held for one CPI (dwell). Coherent
                     integration only happens inside a dwell, where RF and
@@ -960,15 +1635,25 @@ def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
     snr1_tgt_db = lin_to_db(snr1_r4 / r_tgt ** 4) - path_tgt_db
 
     # ---------- one dwell per PRI ----------
+    f0_hz = freq_ghz * 1e9
+    tau_tgt = 2.0 * r_tgt / C                  # true round trip delay
+    pchain = PhaseChain(dict(chain or {}, f0_hz=f0_hz, pw_s=pw_s), b_eff)
     dwells = []
     for p in pri_list:
         pri_s = p * 1e-6
         n = (pulse_count(p, cpi_ms) if n_pulses is None
              else int(round(n_pulses)))
-        integ_db = integ_total if n > 1 else 0.0
+        jm = jitter_metrics(n, pri_s, pchain, tau_tgt)
+        integ_db = (integ_total + jm["jit_loss_db"]) if n > 1 else 0.0
         ideal_db = lin_to_db(n)
         gain_db = ideal_db - integ_db
-        g_int = db_to_lin(gain_db)
+        g_int = db_to_lin(gain_db + jm["jit_loss_db"])   # without jitter
+        if not pchain.ideal and n > 1:
+            # phase noise loss may depend on the round trip delay (range)
+            def path_j(r_m, _p=pri_s, _n=n):
+                return path_loss(r_m) + pchain.loss_db(_n, _p, 2 * r_m / C)
+        else:
+            path_j = path_loss
         ru = C * pri_s / 2
         apparent = r_tgt % ru                  # folded (apparent) range
         prf_i = 1.0 / pri_s
@@ -988,8 +1673,9 @@ def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
             "int_gain_db": gain_db, "snr1_req_db": snr_db - gain_db,
             "duty": pw_s / pri_s, "avg_w": peak_w * pw_s / pri_s,
             "energy_cpi": energy_pulse * n,
-            "r_coh": solve_range(snr1_r4 * g_int, snr_db, path_loss),
-            "r_coh_bore": solve_range(snr1_r4_bore * g_int, snr_db, path_loss),
+            "r_coh": solve_range(snr1_r4 * g_int, snr_db, path_j),
+            "r_coh_bore": solve_range(snr1_r4_bore * g_int, snr_db, path_j),
+            **jm,
             "ru": ru, "apparent": apparent, "eclipsed": eclipsed,
             "snr_int_tgt_db": snr1_tgt_db + gain_db, "margin_db": margin,
             "detected": (not eclipsed) and margin >= 0, "why": why,
@@ -1009,6 +1695,16 @@ def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
             budget.append((name, 0.0, "not applied: N = 1"))
         else:
             budget.append((name, value, note_))
+    if not pchain.ideal:
+        budget.append((
+            "Phase noise (signal chain)",
+            L["jit_loss_db"] if L["n"] > 1 else 0.0,
+            f"coherent, at {r_tgt/1000:.1f} km" if L["n"] > 1
+            else "not applied: N = 1"))
+    for d in dwells:
+        d["jit_res_factor"] = min(d["jit_res_factor"], d["n"])  # <= PRF
+        d["df_eff_hz"] = d["df_res_hz"] * d["jit_res_factor"]
+        d["dv_eff"] = d["dv_res"] * d["jit_res_factor"]
 
     # ---------- PRI switching: unambiguous range and ambiguity resolution ----------
     lcm_us, lcm_exact = pri_lcm_us(pri_list)
@@ -1038,7 +1734,7 @@ def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
         sub = [dwells[i] for i in det_idx]
         g_sub, _ = pri_gcd_us([d["pri_us"] for d in sub])
         span_sub = 1e6 / g_sub
-        tol_f = max(d["df_res_hz"] for d in sub)
+        tol_f = max(d["df_eff_hz"] for d in sub)
         cands_f = resolve_range([d["dop_app_hz"] % d["prf_hz"] for d in sub],
                                 [d["prf_hz"] for d in sub], span_sub, tol_f)
         dres.update(tol_hz=tol_f, span_hz=span_sub,
@@ -1236,6 +1932,8 @@ def radar_calc(p_dbm, pri_list_us, pw_us, mop, mop_param, bw_mhz,
         "tang_ms": tang_ms,
         "los_rate_dps": los_rate_dps,
         "f_dop_hz": f_dop,
+        "chain": pchain,
+        "tau_tgt_s": tau_tgt,
         "dop_span_hz": dop_span,
         "dop_unamb_ms": wavelength * dop_span / 4.0,
         "ru_eff": ru_eff,
@@ -1389,6 +2087,7 @@ def evaluate(inp, tables):
         freq_ghz=freq, nf_db=values["nf"], snr_db=inp["snr"],
         temp_k=inp["temp"], cpi_ms=inp.get("cpi"),
         n_pulses=inp.get("n_pulses"), speed_ms=speed, radial_ms=radial,
+        chain=inp.get("chain"),
         gain_dbi=gain, gain_peak_dbi=peak, rcs_m2=rcs,
         target_km=inp["tgt_range"],
         losses={k: values[k] for k, *_ in LOSS_FIELDS},
@@ -1504,6 +2203,7 @@ def doppler_lines(res, line):
         out.append(line("Unambiguous Doppler",
                         f"+-{d['prf_hz']/2:,.0f} Hz = +-{d['v_unamb']:.1f} m/s "
                         f"(+-{d['v_unamb']*3.6:.0f} km/h)"))
+        out += jitter_lines(res, d, line)
     else:
         out.append(
             f"  {'#':>2} {'PRF(Hz)':>10} {'Tcoh(ms)':>9} {'dF(Hz)':>8} "
@@ -1524,7 +2224,62 @@ def doppler_lines(res, line):
                 f"Accuracy @ threshold (PRI {lim+1})",
                 f"{d['sig_f_thr']:.3g} Hz = {d['sig_v_thr']:.3g} m/s  "
                 f"(SNR {res['snr_req_db']:.1f} dB)"))
+        if not res["chain"].ideal:
+            out.append("  Phase noise per PRI:  " + ", ".join(
+                f"#{i+1} {d_['jit_loss_db']:.2f} dB / x{d_['jit_res_factor']:.2f}"
+                for i, d_ in enumerate(dw)) + "  (loss / resolution factor)")
+        out += jitter_lines(res, d, line, f" (PRI {lim+1})")
     out.append("")
+    return out
+
+
+def jitter_lines(res, d, line, tag=""):
+    """Signal chain phase noise effect on one dwell, for the results text."""
+    ch = res["chain"]
+    tau = res["tau_tgt_s"]
+    pri = d["pri_us"] * 1e-6
+    out = ["", "SIGNAL CHAIN / PHASE NOISE" + (f"  ({tag.strip(' ()')})"
+                                           if tag else ""),
+           "  " + ch.describe()]
+    sy = ch.sigma_y(pri)
+    if sy is not None:
+        out.append(line(("STALO" if ch.mag else "Source") + " stability",
+                        f"Allan dev. {sy:.3g} at tau = PRI (from L(f))"))
+    out.append(line("Round trip / PRI",
+                    f"{tau*1e6:,.1f} us = {tau/pri:.2f} PRI"))
+    if d["n"] < 2:
+        return out + [line("Phase noise effect", "n/a (N = 1)"), ""]
+    def fl(v):
+        return "-" if v is None else f"{v:.1f}"
+
+    out.append(f"  {'block':<46}{'dphi(deg rms)':>14}{'loss(dB)':>10}"
+               f"{'floor(dBc)':>12}")
+    for name, loss, dphi, floor in d["jit_comps"]:
+        out.append(f"  {name:<46}{math.degrees(dphi):>14.3g}{loss:>10.2f}"
+                   f"{fl(floor):>12}")
+    out += [
+        f"  {'TOTAL':<46}{math.degrees(d['jit_dphi']):>14.3g}"
+        f"{d['jit_loss_db']:>10.2f}{fl(d['jit_floor_dbc']):>12}",
+        "  dphi  = rms phase difference of consecutive pulses (phi_k+1 - "
+        "phi_k, pulse-to-pulse)",
+        "          at the target range, after COHO / LO correction",
+        "  loss  = coherent integration loss of the target (in the budget)",
+        "  floor = Doppler phase-noise floor re the target line (dBc per "
+        "Doppler filter,",
+        "          median of the filters > 8 bins from the line): limits "
+        "clutter",
+        "          cancellation / sub-clutter visibility (strong clutter "
+        "spreads to it)",
+        "  oscillators: full L(f); offsets above ~1/PW are averaged by the "
+        "matched filter",
+        "          (they go to the range sidelobes, not to the Doppler floor)",
+        line("Doppler res. w/ phase noise",
+             f"{d['df_eff_hz']:,.2f} Hz = {d['dv_eff']:.3f} m/s  "
+             f"(x{d['jit_res_factor']:.2f} of the ideal -3 dB width)"),
+    ]
+    if d["jit_res_factor"] * d["df_res_hz"] >= d["prf_hz"] * 0.99:
+        out.append("  ! coherence lost: the target line fills the whole "
+                   "Doppler band")
     return out
 
 
@@ -2017,16 +2772,28 @@ def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
     centres = [((k if k < nfft / 2 else k - nfft) * prf / nfft) for k in ks]
 
     snr_db = res["snr_int_tgt_db"]
-    amp = math.sqrt(10 ** (snr_db / 10) * sw2 / sw ** 2)
+    jit_db = d.get("jit_loss_db", 0.0)
+    # amplitude for the jitter-free SNR; the jitter phases then lower the peak
+    amp = math.sqrt(10 ** ((snr_db + jit_db) / 10) * sw2 / sw ** 2)
     rng = np.random.default_rng(seed)
     t = np.arange(n) / prf
     noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / math.sqrt(2)
-    clean = amp * np.exp(2j * math.pi * f_app * t)
+    ideal = amp * np.exp(2j * math.pi * f_app * t)
+    chain = res["chain"]
+    jitter = not chain.ideal
+    pri_s, tau = d["pri_us"] * 1e-6, res["tau_tgt_s"]
+    clean = ideal * chain.gains(n, pri_s, tau,
+                                np.random.default_rng(seed + 7919))
 
     def spec(x, size):
         return 10 * np.log10(np.maximum(
             np.abs(np.fft.fft(w * x, size)) ** 2 / sw2, 1e-12))
 
+    expected = None
+    if jitter:          # mean target spectrum over all jitter realisations
+        expected = np.fft.fftshift(10 * np.log10(np.maximum(
+            amp ** 2 * chain.spectrum(w, m, pri_s, tau, f_app / prf) / sw2,
+            1e-12)))
     bins_total = spec(clean + noise, nfft)
     # every PRI dwell folds the true Doppler into its own +-PRF/2; combining
     # the dwells (PRI Switcher) recovers it inside +-1/(2 GCD(PRI))
@@ -2043,6 +2810,11 @@ def simulate_doppler(res, window="Hamming", seed=1, grid=8192):
         "window": window, "n": n, "prf": prf, "nfft": nfft, "freq": freq,
         "bank": np.array(bank), "centres": centres,
         "fine_clean": np.fft.fftshift(spec(clean, m)),
+        "fine_ideal": np.fft.fftshift(spec(ideal, m)) if jitter else None,
+        "fine_expected": expected,
+        "jit_db": jit_db, "dphi": d.get("jit_dphi", 0.0),
+        "df_eff": d.get("df_eff_hz", d["df_res_hz"]),
+        "jit_factor": d.get("jit_res_factor", 1.0),
         "fine_total": np.fft.fftshift(spec(clean + noise, m)),
         "bin_f": np.fft.fftshift(np.fft.fftfreq(nfft, 1 / prf)),
         "bin_total": np.fft.fftshift(bins_total),
@@ -2087,8 +2859,23 @@ def draw_doppler(fig, res, sim, zoom=True):
 
     ax2.plot(f, sim["fine_total"], color="#4a90c2", lw=0.8, alpha=0.9,
              label="signal + noise (filter outputs)")
+    jit_on = sim["fine_expected"] is not None
+    if jit_on:
+        ax2.plot(f, sim["fine_ideal"], color="#7f8c8d", lw=1.0, ls=":",
+                 label="signal, no phase noise", zorder=2)
+        ax2.plot(f, sim["fine_expected"], color="#8e44ad", lw=1.3,
+                 label="signal with phase noise (mean)", zorder=3)
+        # jitter view on the filter bank: mean line shape re ideal peak
+        ref = float(np.max(sim["fine_ideal"]))
+        ax1.plot(f, sim["fine_ideal"] - ref, color="#7f8c8d", lw=1.0,
+                 ls=":", label="target line, no phase noise", zorder=4)
+        ax1.plot(f, sim["fine_expected"] - ref, color="#8e44ad", lw=1.6,
+                 label="target line with phase noise (mean)", zorder=4)
+        ax1.legend(loc="upper right", fontsize=7)
     ax2.plot(f, sim["fine_clean"], color="#e67e22", lw=1.5,
-             label="signal only", zorder=3)
+             label="signal only" + (" (this phase noise sample)"
+                                    if jit_on else ""),
+             zorder=3)
     ax2.plot(sim["bin_f"], sim["bin_total"], ".", color="#1f4e79", ms=4,
              label="FFT bins")
     ax2.axhline(0, color="gray", ls="--", lw=1.2,
@@ -2096,8 +2883,8 @@ def draw_doppler(fig, res, sim, zoom=True):
     ax2.axhline(sim["thr_db"], color="#c0392b", ls="--", lw=1.2,
                 label=f"required SNR ({sim['thr_db']:.1f} dB)")
     ax2.axvline(sim["f_app"], color="green", lw=0.8, alpha=0.6)
-    top = max(10.0, sim["snr_db"] + 8, sim["thr_db"] + 8)
-    ax2.set_ylim(-30, top)
+    top = max(10.0, sim["snr_db"] + sim["jit_db"] + 8, sim["thr_db"] + 8)
+    ax2.set_ylim(-40 if jit_on else -30, top)
     ax2.set_ylabel("power re noise (dB)", fontsize=8)
     ax2.set_xlabel("Doppler (Hz)", fontsize=8)
     v_true = sim["f_true"] * lam / 2
@@ -2129,11 +2916,17 @@ def draw_doppler(fig, res, sim, zoom=True):
     loss_txt = (f"; window loss {sim['pl_db']:.2f} dB here vs "
                 f"{budget_loss:.2f} dB in the loss budget"
                 if budget_loss is not None else "")
+    jit_txt = ""
+    if jit_on:
+        jit_txt = (f"\nsignal chain phase noise: pulse-to-pulse "
+                   f"{math.degrees(sim['dphi']):.3g} deg rms, loss "
+                   f"{sim['jit_db']:.2f} dB, line width x"
+                   f"{sim['jit_factor']:.2f} ({sim['df_eff']:,.1f} Hz)")
     ax2.set_title(
         f"Target Doppler line, N = {sim['n']}, PRF {prf:,.0f} Hz\n{note}\n"
         f"peak SNR {sim['snr_db']:.1f} dB (theory), "
         f"{sim['measured_db']:.1f} dB (this noise sample)\n"
-        f"{loss_txt.lstrip('; ')}", fontsize=9)
+        f"{loss_txt.lstrip('; ')}{jit_txt}", fontsize=9)
     ax2.legend(loc="upper right", fontsize=7)
     for ax in (ax1, ax2):
         ax.set_xlim(-half, half)
@@ -2150,6 +2943,297 @@ def draw_doppler(fig, res, sim, zoom=True):
     sec.set_xlabel("radial velocity (m/s)", fontsize=8)
     sec.tick_params(labelsize=7)
     fig.tight_layout()
+
+
+# =================================================================
+# SIGNAL CHAIN VIEW (numpy + matplotlib)
+# =================================================================
+
+CHAIN_COLORS = ["#2c7fb8", "#e67e22", "#8e44ad", "#c0392b", "#16a085",
+                "#7f8c8d", "#d4ac0d"]
+
+
+def _chain_block(ax, x, y, w, h, title, body, color):
+    from matplotlib.patches import FancyBboxPatch
+    ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.04",
+                                fc=color, ec="#34495e", lw=1.0, alpha=0.9))
+    ax.text(x + w / 2, y + h - 0.12, title, ha="center", va="top",
+            fontsize=8.5, weight="bold")
+    ax.text(x + w / 2, y + h - 0.42, body, ha="center", va="top",
+            fontsize=7, linespacing=1.25)
+
+
+def _chain_arrow(ax, p0, p1, text="", ls="-", color="#34495e"):
+    ax.annotate("", xy=p1, xytext=p0,
+                arrowprops=dict(arrowstyle="->", color=color, lw=1.2, ls=ls))
+    if text:
+        ax.text((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2 + 0.08, text,
+                ha="center", va="bottom", fontsize=6.5, color=color)
+
+
+def _mixer(ax, x, y, label="", r=0.22):
+    from matplotlib.patches import Circle
+    ax.add_patch(Circle((x, y), r, fc="white", ec="#34495e", lw=1.0))
+    ax.text(x, y, "X", ha="center", va="center", fontsize=11, weight="bold")
+    if label:
+        ax.text(x + r + 0.04, y + r, label, fontsize=6.5, color="#555555")
+
+
+def draw_chain(fig, res):
+    """Block diagram of the signal chain and the effect of every block vs
+    target range (limiting dwell: its N and PRI)."""
+    fig.clear()
+    ch = res["chain"]
+    sp = ch.spec
+    d = res["dwells"][res["lim"]]
+    n, pri = d["n"], d["pri_us"] * 1e-6
+    comps = d["jit_comps"]
+
+    def contrib(names):
+        rows = [c for c in comps if any(k in c[0] for k in names)]
+        if not rows:
+            return ""
+        dphi = math.degrees(math.sqrt(sum(c[2] ** 2 for c in rows)))
+        fl = [c[3] for c in rows if c[3] is not None]
+        txt = f"Δφ pulse-to-pulse {dphi:.3g} deg rms"
+        if fl:
+            txt += f"\nfloor {10 * math.log10(sum(10 ** (v / 10) for v in fl)):.1f} dBc"
+        return txt
+
+    gs = fig.add_gridspec(4, 2, height_ratios=[1.35, 0.16, 1.0, 1.0],
+                          hspace=0.5, wspace=0.2)
+    ax = fig.add_subplot(gs[0, :])
+    ax.set_xlim(0, 10)
+    ax.set_ylim(-0.25 if ch.mag else 0, 3.45)
+    ax.axis("off")
+    osc = "L(f): plot (c)"
+    tgt = f"Target\n{res['target_km']:g} km\ntau {res['tau_tgt_s']*1e6:,.1f} us"
+    ax.text(8.9, 2.65, tgt, ha="center", va="center", fontsize=8)
+    if not ch.mag:
+        _chain_block(ax, 0.1, 1.95, 2.0, 1.4, "Source (exciter)",
+                     osc + "\n" + contrib(["Source"]), "#d6eaf8")
+        amp = sp["amp"]
+        if amp == "None (source direct)":
+            _chain_block(ax, 2.7, 1.95, 2.0, 1.4, "No amplifier",
+                         "source drives\nthe antenna", "#eeeeee")
+        else:
+            _chain_block(ax, 2.7, 1.95, 2.0, 1.4, amp,
+                         f"{sp['amp_push']:g} deg/% x {sp['amp_supply']:g} %"
+                         f"\n+ {sp['amp_add']:g} deg rms\n"
+                         + contrib([amp]), "#fdebd0")
+        _chain_arrow(ax, (2.1, 2.65), (2.7, 2.65))
+        _chain_arrow(ax, (4.7, 2.65), (5.3, 2.65))
+        if sp["rx_lo"] == "shared":
+            ax.plot([1.1, 1.1, 5.3], [1.95, 0.55, 0.55], color="#2c7fb8",
+                    lw=1.2)
+            _chain_arrow(ax, (5.3, 0.55), (5.55, 0.55), color="#2c7fb8")
+            ax.text(2.9, 0.62, "LO = same oscillator (range correlation)",
+                    fontsize=7, color="#2c7fb8")
+        else:
+            _chain_block(ax, 2.7, 0.05, 2.0, 1.3, "RX LO (independent)",
+                         "L(f): plot (c)\n" + contrib(["RX LO"]),
+                         "#d5f5e3")
+            _chain_arrow(ax, (4.7, 0.55), (5.55, 0.55))
+    else:
+        # Magnetron: TX sample -> M1 (x STALO) -> IF -> locks the COHO;
+        # echo -> M2 (x STALO) -> IF -> M3 (x COHO) -> I/Q baseband
+        def dphi_of(name):
+            rows = [c for c in comps if c[0] == name]
+            return math.degrees(rows[0][2]) if rows else None
+
+        mode = sp["coho_mode"]
+        if mode == "none":
+            mag_txt = (f"P2P {sp['mag_fjit_khz']:g} kHz, intrapulse "
+                       f"{sp['mag_chirp_khz']:g} kHz\nrandom start phase\n"
+                       "every pulse")
+        else:
+            e1 = dphi_of("Magnetron P2P freq. jitter")
+            e2 = dphi_of("Magnetron intrapulse freq. jitter")
+            fl = contrib(["Magnetron"]).split("\n")
+            mm = [c for c in comps if c[0].startswith(
+                "Magnetron P2P freq. mismatch")]
+            mm_txt = (f"MF mismatch {mm[0][1]:.2f} dB" if mm
+                      else "MF = TX replica")
+            mag_txt = (f"P2P {sp['mag_fjit_khz']:.3g} kHz: Δφ {e1:.3g}°\n"
+                       f"intra {sp['mag_chirp_khz']:.3g} kHz: Δφ {e2:.3g}°\n"
+                       f"{mm_txt}, PW {res['pw_us']:g} us"
+                       + (f"\n{fl[1]}" if len(fl) > 1 else ""))
+        _chain_block(ax, 0.1, 1.9, 2.35, 1.52, "Magnetron", mag_txt,
+                     "#fadbd8")
+        _chain_arrow(ax, (2.4, 2.65), (5.3, 2.65), "RF")
+        _chain_block(ax, 2.6, 1.25, 2.2, 1.15, "STALO",
+                     osc + "\n" + contrib(["STALO"]).split("\n")[0], "#d6eaf8")
+        _mixer(ax, 5.8, 1.5, "M2")
+        _chain_arrow(ax, (5.8, 1.95), (5.8, 1.7))
+        _chain_arrow(ax, (4.8, 1.55), (5.58, 1.52))
+        _chain_arrow(ax, (5.8, 1.28), (5.8, 0.8), "  IF", color="#34495e")
+        if sp["coho"]:
+            _mixer(ax, 1.2, 1.5)
+            ax.text(0.92, 1.5, "M1", fontsize=6.5, color="#555555",
+                    ha="right", va="center")
+            _chain_arrow(ax, (1.2, 1.9), (1.2, 1.72), ls="--")
+            ax.text(1.26, 1.8, "TX sample (RF)", fontsize=6.5, va="center")
+            _chain_arrow(ax, (2.6, 1.55), (1.42, 1.5))
+            _chain_arrow(ax, (1.2, 1.28), (1.2, 1.12))
+            if mode == "analog":
+                ax.text(1.42, 1.2, "IF sample: locks COHO", fontsize=6.5,
+                        va="center")
+                _chain_block(ax, 0.1, -0.2, 3.4, 1.25, "Analog COHO (IF)",
+                             f"locked at the "
+                             f"{LOCK_POINTS[sp['lock_point']].lower()}, "
+                             f"residual {sp['mag_lock']:g} deg\n"
+                             + contrib(["COHO"]), "#fdebd0")
+                _chain_arrow(ax, (3.5, 0.55), (5.55, 0.55), "IF reference")
+            else:
+                ax.text(1.42, 1.2, "IF sample -> ADC", fontsize=6.5,
+                        va="center")
+                _chain_block(ax, 0.1, -0.2, 3.4, 1.25,
+                             "Digital COHO (ADC + burst analysis)",
+                             f"{DIG_CORR[sp['dig_corr']]}\n"
+                             f"meas. error {sp['dig_err']:g} deg, phase memory "
+                             + ("on" if sp["dig_memory"] else "off") + "\n"
+                             + contrib(["COHO"]).split("\n")[0], "#e8f8f5")
+                _chain_arrow(ax, (3.5, 0.55), (5.55, 0.55),
+                             "phase / replica per pulse")
+        else:
+            ax.text(1.8, 0.6, "NO COHO: phase of each pulse unknown",
+                    ha="center", fontsize=7.5, color="#c0392b")
+        _mixer(ax, 5.8, 0.55, "M3")
+        ax.text(5.0, 0.12, "ADC, digital I/Q + correction"
+                if mode == "digital" else "I/Q detection",
+                fontsize=6.5, ha="center")
+    _chain_block(ax, 5.3, 1.95, 1.6, 1.4, "Duplexer +\nantenna", "", "#eeeeee")
+    _chain_arrow(ax, (6.9, 2.8), (8.2, 2.8), "TX")
+    _chain_arrow(ax, (8.2, 2.45), (6.9, 2.45), "echo", ls="--")
+    if not ch.mag:
+        _mixer(ax, 5.8, 0.55)
+        _chain_arrow(ax, (6.1, 1.95), (5.85, 0.82))
+    _chain_block(ax, 6.7, 0.05, 3.1, 1.3, "Matched filter + Doppler FFT",
+                 f"N = {n}, PRI {d['pri_us']:g} us\nloss {d['jit_loss_db']:.2f}"
+                 f" dB, floor "
+                 + ("-" if d["jit_floor_dbc"] is None
+                    else f"{d['jit_floor_dbc']:.1f} dBc")
+                 + f"\nline width x{d['jit_res_factor']:.2f}", "#e8daef")
+    _chain_arrow(ax, (6.05, 0.55), (6.7, 0.55))
+    ax.set_title(CHAIN_TYPES[sp["type"]] + "  -  phase noise of every block "
+                 "adds; effects at the target range", fontsize=9)
+
+    # ---- (a) loss and (b) Doppler floor vs range, per block ----
+    r_max = max(2.0 * res["target_km"], 1.2 * res["r_coh"] / 1000.0, 5.0)
+    rk = np.linspace(r_max / 60, r_max, 60)
+    taus = 2 * rk * 1000.0 / C
+    a1 = fig.add_subplot(gs[2, 0])
+    a2 = fig.add_subplot(gs[2, 1])
+    a3 = fig.add_subplot(gs[3, 0])
+    a4 = fig.add_subplot(gs[3, 1])
+    sets = [([c], c[0], CHAIN_COLORS[i % len(CHAIN_COLORS)])
+            for i, c in enumerate(ch.comps)]
+    sets.append((ch.comps, "TOTAL", "black"))
+    handles = []
+    for cs, name, col in sets:
+        lw, ls = (2.2, "-") if name == "TOTAL" else (1.4, "--")
+        h, = a1.plot(rk, [ch.loss_db(n, pri, t, cs) for t in taus],
+                     color=col, lw=lw, ls=ls, label=name)
+        handles.append(h)
+        fl = [doppler_floor_dbc(ch, n, pri, t, cs) for t in taus]
+        if any(v is not None for v in fl):
+            a2.plot(rk, [np.nan if v is None else v for v in fl], color=col,
+                    lw=lw, ls=ls)
+    # mark the values at the target range on the TOTAL curves
+    a1.plot(res["target_km"], d["jit_loss_db"], "o", color="black", ms=6,
+            zorder=5)
+    a1.annotate(f" {d['jit_loss_db']:.2f} dB", (res["target_km"],
+                d["jit_loss_db"]), fontsize=8.5, weight="bold",
+                xytext=(8, -16), textcoords="offset points")
+    if d["jit_floor_dbc"] is not None:
+        a2.plot(res["target_km"], d["jit_floor_dbc"], "o", color="black",
+                ms=6, zorder=5)
+        a2.annotate(f" {d['jit_floor_dbc']:.1f} dBc (TOTAL)",
+                    (res["target_km"], d["jit_floor_dbc"]), fontsize=8.5,
+                    weight="bold", xytext=(8, -16), textcoords="offset points")
+    a1.set_title("(a) Coherent loss of the target (dB)", fontsize=10)
+    a2.set_title("(b) Doppler phase-noise floor (dBc)", fontsize=10)
+    ru_km = C * pri / 2000.0
+    show_ru = (any(k == "trip" for _n, k, _p in ch.comps)
+               and ru_km < r_max)
+    for a in (a1, a2):
+        a.axvline(res["target_km"], color="green", lw=1.2, alpha=0.8)
+        if show_ru:
+            a.axvline(ru_km, color="#c0392b", lw=1.2, ls=":", alpha=0.9)
+        a.set_xlabel(f"target range (km)  [N = {n}, PRI {d['pri_us']:g} us]",
+                     fontsize=8.5)
+        a.tick_params(labelsize=8)
+        a.grid(alpha=0.3)
+    if show_ru:
+        a1.text(ru_km, 0.5, " Ru: 2nd trip incoherent", rotation=90,
+                transform=a1.get_xaxis_transform(), fontsize=7.5,
+                color="#c0392b", va="center")
+    lax = fig.add_subplot(gs[1, :])
+    lax.axis("off")
+    lax.legend(handles=handles, loc="center", ncol=min(3, len(handles)),
+               fontsize=7.5, frameon=False, handlelength=2.2,
+               columnspacing=1.2)
+
+    # ---- (c) oscillator phase noise inputs ----
+    tau_t = res["tau_tgt_s"]
+    f = np.geomspace(10.0, 1e8, 600)
+    pw = res["pw_us"] * 1e-6
+    shared_names = {"COHO (IF)"} | ({"STALO", "Source"}
+                                    if ch.mag or sp["rx_lo"] == "shared"
+                                    else set())
+    for i, (label, pn) in enumerate(ch.oscillators()):
+        col = ["#2c7fb8", "#16a085", "#e67e22"][i % 3]
+        a3.semilogx(f, pn.l_dbc(f), color=col, lw=2, label=f"{label} L(f)")
+        a3.plot(pn.f_hz, pn.l_db, "o", color=col, ms=5)
+        if label in shared_names:
+            # mean of 4 sin^2(pi f tau): (2 pi f tau)^2 below, 2 above
+            eff = pn.l_dbc(f) + 10 * np.log10(
+                np.maximum(np.minimum((2 * np.pi * f * tau_t) ** 2, 2.0),
+                           1e-30))
+            a3.semilogx(f, eff, color=col, lw=1.0, ls="--", alpha=0.8,
+                        label=f"{label}: left after range correlation")
+    for x, txt in ((1 / (2 * pri), "PRF/2"), (1 / pw, "1/PW")):
+        a3.axvline(x, color="gray", lw=1, ls=":")
+        a3.text(x, 0.98, " " + txt, transform=a3.get_xaxis_transform(),
+                fontsize=7.5, color="gray", va="top")
+    a3.set_ylim(-190, -30)
+    a3.set_xlim(10, 1e8)
+    a3.set_title("(c) Oscillator L(f)  (points = inputs)", fontsize=10)
+    a3.set_xlabel("offset from carrier (Hz)", fontsize=8.5)
+    a3.set_ylabel("dBc/Hz", fontsize=8.5)
+    a3.tick_params(labelsize=8)
+    a3.grid(alpha=0.3, which="both")
+    a3.legend(fontsize=7, loc="upper right", framealpha=0.85)
+
+    # ---- (d) expected Doppler spectrum at the target range ----
+    size = 4096
+    win = blackman_harris(n) if n >= 8 else np.ones(n)
+    s_id = ch.spectrum(win, size, pri, tau_t, comps=[])
+    s_ch = ch.spectrum(win, size, pri, tau_t)
+    fx = (np.arange(size) - size // 2) / size / pri / 1e3
+    pk = max(s_id.max(), 1e-30)
+    for sv, col, lw, lab in ((s_id, "#95a5a6", 1.2,
+                              "ideal (window sidelobes only)"),
+                             (s_ch, "black", 1.6, "with signal chain")):
+        a4.plot(fx, 10 * np.log10(np.maximum(np.fft.fftshift(sv), 1e-30)
+                                  / pk), color=col, lw=lw, label=lab)
+    if d["jit_floor_dbc"] is not None:
+        a4.axhline(d["jit_floor_dbc"], color="black", lw=1.2, ls=":",
+                   label=f"floor {d['jit_floor_dbc']:.1f} dBc = (b) TOTAL "
+                   "at target")
+        g_khz = 8.0 / (n * pri) / 1e3            # +-8 bins: not in the floor
+        a4.axvspan(-g_khz, g_khz, color="#f4d03f", alpha=0.18, lw=0,
+                   label="+-8 bins: excluded from the floor value")
+    a4.set_ylim(-110, 5)
+    a4.set_xlim(fx[0], fx[-1])
+    a4.set_title("(d) Doppler spectrum at the target range", fontsize=10)
+    a4.set_xlabel("offset from the echo line (kHz), Blackman-Harris",
+                  fontsize=8.5)
+    a4.set_ylabel("dB re peak", fontsize=8.5)
+    a4.tick_params(labelsize=8)
+    a4.grid(alpha=0.3)
+    a4.legend(fontsize=7, loc="lower right", framealpha=0.9)
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.96, bottom=0.06)
 
 
 # =================================================================
@@ -2657,9 +3741,10 @@ def build_gui():
         return frame
 
     radar_f = section("Radar", 0)
-    ant_f = section("Antenna", 1)
-    tgt_f = section("Target", 2)
-    loss_f = section("Losses ('table' = read from frequency table)", 3)
+    tx_f = section("Transmitter / signal chain (phase noise)", 1)
+    ant_f = section("Antenna", 2)
+    tgt_f = section("Target", 3)
+    loss_f = section("Losses ('table' = read from frequency table)", 4)
 
     notebook = ttk.Notebook(main)
     notebook.grid(row=0, column=1, rowspan=2, sticky="nsew")
@@ -2673,6 +3758,9 @@ def build_gui():
     geo_tab.rowconfigure(0, weight=1)
     max_tab = ttk.Frame(notebook, padding=8)
     notebook.add(max_tab, text="Optimizasyon")
+    chain_tab = ttk.Frame(notebook, padding=8)
+    notebook.insert(0, chain_tab, text="Signal chain")
+    notebook.select(out)
     max_tab.columnconfigure(0, weight=1)
     max_tab.rowconfigure(1, weight=1)
 
@@ -2944,9 +4032,345 @@ def build_gui():
     sw_box.bind("<<ComboboxSelected>>", sw_defaults)
     sw_defaults()
 
+    # ---- Transmitter / signal chain inputs (left column, "Transmitter") ----
+    chain_tab.columnconfigure(0, weight=1)
+    chain_tab.rowconfigure(1, weight=1)
+    cv = {}                               # chain input variables
+    chain_rows = {}
+    type_names = {v: k for k, v in CHAIN_TYPES.items()}
+    lo_names = {v: k for k, v in RX_LO_TYPES.items()}
+    lock_names = {v: k for k, v in LOCK_POINTS.items()}
+    corr_names = {v: k for k, v in DIG_CORR.items()}
+    tx_f.columnconfigure(0, weight=1)
+    tx_f.columnconfigure(1, weight=1)
+    cv["type"] = tk.StringVar(value=CHAIN_TYPES[CHAIN_DEFAULT["type"]])
+    top = ttk.Frame(tx_f)
+    top.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    ttk.Label(top, text="Transmitter type").pack(side="left")
+    type_box = ttk.Combobox(top, textvariable=cv["type"], state="readonly",
+                            width=34, values=list(CHAIN_TYPES.values()))
+    type_box.pack(side="left", padx=(12, 0))
+    ttk.Label(tx_f, text="Phase noise of every block adds (independent "
+              "processes); results and plots: 'Signal chain' tab.\n"
+              "Oscillator L(f): datasheet points 'offset kHz:dBc/Hz, ...' "
+              "(flat beyond the last point). Presets are rough.",
+              foreground="gray45").grid(row=3, column=0, columnspan=2,
+                                        sticky="w", pady=(4, 0))
+
+    def ch_frame(row, col, title, span=1):
+        f = ttk.LabelFrame(tx_f, text=title, padding=6)
+        f.grid(row=row, column=col, columnspan=span, sticky="nsew",
+               padx=(0, 6 if col == 0 and span == 1 else 0), pady=(0, 4))
+        return f
+
+    def ch_entry(frame, key, label, default, hint=""):
+        r = chain_rows.get(frame, 0)
+        ttk.Label(frame, text=label).grid(row=r, column=0, sticky="w")
+        cv[key] = tk.StringVar(value=f"{default:g}")
+        e = ttk.Entry(frame, textvariable=cv[key], width=7)
+        e.grid(row=r, column=1, sticky="w", padx=(6, 0), pady=1)
+        if hint:
+            ttk.Label(frame, text=hint, foreground="gray45").grid(
+                row=r, column=2, sticky="w", padx=(6, 0))
+        chain_rows[frame] = r + 1
+        return e
+
+    def osc_input(frame, key, presets, default_text, label="L(f)"):
+        """Preset selector + editable 'kHz:dBc/Hz' point list."""
+        r = chain_rows.get(frame, 0)
+        names = list(presets) + [CUSTOM]
+        start = next((k for k, v in presets.items() if v == default_text),
+                     CUSTOM)
+        cv[key + "_preset"] = tk.StringVar(value=start)
+        ttk.Label(frame, text="Preset").grid(row=r, column=0, sticky="w")
+        box = ttk.Combobox(frame, textvariable=cv[key + "_preset"],
+                           state="readonly", width=33, values=names)
+        box.grid(row=r, column=1, columnspan=2, sticky="w", padx=(6, 0),
+                 pady=1)
+        cv[key] = tk.StringVar(value=default_text)
+        ttk.Label(frame, text=label).grid(row=r + 1, column=0, sticky="w")
+        ent = ttk.Entry(frame, textvariable=cv[key], width=36)
+        ent.grid(row=r + 1, column=1, columnspan=2, sticky="w", padx=(6, 0),
+                 pady=1)
+        chain_rows[frame] = r + 2
+
+        def on_preset(*_):
+            name = cv[key + "_preset"].get()
+            if name in presets and cv[key].get() != presets[name]:
+                cv[key].set(presets[name])
+
+        def on_text(*_):
+            name = cv[key + "_preset"].get()
+            if presets.get(name) != cv[key].get():
+                match = next((k for k, v in presets.items()
+                              if v == cv[key].get()), CUSTOM)
+                if match != name:
+                    cv[key + "_preset"].set(match)
+
+        box.bind("<<ComboboxSelected>>", on_preset)
+        cv[key].trace_add("write", on_text)
+        return box, ent
+
+    src_f = ch_frame(1, 0, "Source oscillator (exciter)")
+    osc_input(src_f, "src_pn", OSC_PRESETS, CHAIN_DEFAULT["src_pn"])
+
+    amp_f = ch_frame(1, 1, "Power amplifier")
+    cv["amp"] = tk.StringVar(value=CHAIN_DEFAULT["amp"])
+    ttk.Label(amp_f, text="Type").grid(row=0, column=0, sticky="w")
+    amp_box = ttk.Combobox(amp_f, textvariable=cv["amp"], state="readonly",
+                           width=17, values=list(AMP_TYPES))
+    amp_box.grid(row=0, column=1, columnspan=2, sticky="w", padx=(6, 0))
+    chain_rows[amp_f] = 1
+    amp_entries = [
+        ch_entry(amp_f, "amp_push", "Phase pushing (deg/%)",
+                 CHAIN_DEFAULT["amp_push"]),
+        ch_entry(amp_f, "amp_supply", "Supply jitter (% rms)",
+                 CHAIN_DEFAULT["amp_supply"]),
+        ch_entry(amp_f, "amp_add", "Additive jitter (deg rms)",
+                 CHAIN_DEFAULT["amp_add"])]
+
+    mag_f = ch_frame(1, 1, "Magnetron")
+    ch_entry(mag_f, "mag_fjit_khz", "P2P jitter (kHz rms)",
+             CHAIN_DEFAULT["mag_fjit_khz"])
+    ch_entry(mag_f, "mag_chirp_khz", "Intrapulse (kHz rms)",
+             CHAIN_DEFAULT["mag_chirp_khz"])
+    ttk.Label(mag_f, text="intrapulse: linear f change\n(end - start), "
+              "random/pulse", foreground="gray45").grid(
+        row=chain_rows[mag_f], column=0, columnspan=2, sticky="w")
+    chain_rows[mag_f] += 1
+
+    # calculator: fractional stability (e.g. 7e-7) -> P2P / intrapulse
+    calc_f = ttk.LabelFrame(mag_f, text="From frequency stability",
+                            padding=4)
+    calc_f.grid(row=chain_rows[mag_f], column=0, columnspan=3, sticky="ew",
+                pady=(4, 0))
+    chain_rows[mag_f] += 1
+    calc_v = {"stab": tk.StringVar(value="7e-7"),
+              "kind": tk.StringVar(value="peak"),
+              "fr": tk.StringVar(value="100")}
+    ttk.Label(calc_f, text="Stability df/f").grid(row=0, column=0,
+                                                   sticky="w")
+    ttk.Entry(calc_f, textvariable=calc_v["stab"], width=8).grid(
+        row=0, column=1, sticky="w", padx=(6, 0), pady=1)
+    ttk.Combobox(calc_f, textvariable=calc_v["kind"], state="readonly",
+                 width=5, values=["peak", "rms"]).grid(
+        row=0, column=2, sticky="w", padx=(4, 0))
+    ttk.Label(calc_f, text="Ripple freq. (Hz)").grid(row=1, column=0,
+                                                      sticky="w")
+    ttk.Entry(calc_f, textvariable=calc_v["fr"], width=8).grid(
+        row=1, column=1, sticky="w", padx=(6, 0), pady=1)
+    calc_msg = tk.StringVar(value="uses Frequency and PW of the Radar "
+                            "section")
+    ttk.Label(calc_f, textvariable=calc_msg, foreground="gray35",
+              wraplength=230, justify="left").grid(
+        row=3, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+    def run_stab_calc():
+        try:
+            stab = float(calc_v["stab"].get().replace(",", "."))
+            fr = float(calc_v["fr"].get().replace(",", "."))
+            f0 = float(vars_["freq"].get().replace(",", ".")) * 1e9
+            pw_s = float(vars_["pw"].get().replace(",", ".")) * 1e-6
+            if not (stab > 0 and fr >= 0 and f0 > 0 and pw_s > 0):
+                raise ValueError
+        except (ValueError, KeyError):
+            calc_msg.set("Enter stability > 0, ripple >= 0 and valid "
+                         "Frequency / PW.")
+            return
+        p2p, intra, a, frpw = magnetron_jitter_from_stability(
+            stab, f0, pw_s, fr, calc_v["kind"].get())
+        cv["mag_fjit_khz"].set(f"{p2p:.4g}")
+        cv["mag_chirp_khz"].set(f"{intra:.4g}")
+        msg = (f"peak dev. A = {a/1e3:.4g} kHz at {f0/1e9:g} GHz\n"
+               f"P2P = A/sqrt2 = {p2p:.4g} kHz rms\n"
+               f"intrapulse = sqrt2 A |sin(pi fr PW)| = {intra:.4g} kHz rms")
+        if frpw > 0.25:
+            msg += ("\n! ripple period < 4 PW: the change within the pulse "
+                    "is not linear (model approximation)")
+        calc_msg.set(msg)
+
+    ttk.Button(calc_f, text="Fill P2P / intrapulse",
+               command=run_stab_calc).grid(row=2, column=0, columnspan=3,
+                                            sticky="w", pady=(2, 0))
+
+    # COHO selection: two side by side blocks (+ none), inputs below
+    coho_f = ch_frame(2, 0, "Receive reference (COHO)", span=2)
+    cv["coho_mode"] = tk.StringVar(value=CHAIN_DEFAULT["coho_mode"])
+    sel = ttk.Frame(coho_f)
+    sel.grid(row=0, column=0, sticky="w", pady=(0, 4))
+    coho_btns = []
+    for key, text in (("analog", "Analog COHO\nIF osc. locked"),
+                      ("digital", "Digital COHO\nTX burst -> ADC"),
+                      ("none", "None")):
+        b = ttk.Radiobutton(sel, text=text, value=key,
+                            variable=cv["coho_mode"], style="Toolbutton")
+        b.pack(side="left", padx=(0, 4), ipadx=4, ipady=2, fill="y")
+        coho_btns.append(b)
+
+    ana_f = ttk.Frame(coho_f)
+    ana_f.grid(row=1, column=0, sticky="nw")
+    ttk.Label(ana_f, text="Lock point").grid(row=0, column=0, sticky="w")
+    cv["lock_point"] = tk.StringVar(
+        value=LOCK_POINTS[CHAIN_DEFAULT["lock_point"]])
+    lock_box = ttk.Combobox(ana_f, textvariable=cv["lock_point"],
+                            state="readonly", width=12,
+                            values=list(LOCK_POINTS.values()))
+    lock_box.grid(row=0, column=1, sticky="w", padx=(6, 0))
+    chain_rows[ana_f] = 1
+    ch_entry(ana_f, "mag_lock", "Lock residual (deg rms)",
+             CHAIN_DEFAULT["mag_lock"])
+    osc_input(ana_f, "coho_pn", COHO_PRESETS, CHAIN_DEFAULT["coho_pn"],
+              label="COHO L(f)")
+
+    dig_f = ttk.Frame(coho_f)
+    dig_f.grid(row=1, column=0, sticky="nw")
+    ttk.Label(dig_f, text="Correction").grid(row=0, column=0, sticky="w")
+    cv["dig_corr"] = tk.StringVar(value=DIG_CORR[CHAIN_DEFAULT["dig_corr"]])
+    corr_box = ttk.Combobox(dig_f, textvariable=cv["dig_corr"],
+                            state="readonly", width=14,
+                            values=list(DIG_CORR.values()))
+    corr_box.grid(row=0, column=1, sticky="w", padx=(6, 0))
+    chain_rows[dig_f] = 1
+    ch_entry(dig_f, "dig_err", "Meas. error (deg rms)",
+             CHAIN_DEFAULT["dig_err"])
+    cv["dig_memory"] = tk.BooleanVar(value=CHAIN_DEFAULT["dig_memory"])
+    ttk.Checkbutton(dig_f, text="Phase memory (2nd trip coherent)",
+                    variable=cv["dig_memory"]).grid(
+        row=chain_rows[dig_f], column=0, columnspan=2, sticky="w")
+    chain_rows[dig_f] += 1
+
+    none_lbl = ttk.Label(coho_f, text="No reference: random start phase "
+                         "-> no coherent gain.", foreground="#c0392b")
+    none_lbl.grid(row=1, column=0, sticky="nw")
+
+    lo_f = ch_frame(2, 0, "Receiver LO", span=2)
+    cv["rx_lo"] = tk.StringVar(value=RX_LO_TYPES[CHAIN_DEFAULT["rx_lo"]])
+    ttk.Label(lo_f, text="RX LO").grid(row=0, column=0, sticky="w")
+    lo_box = ttk.Combobox(lo_f, textvariable=cv["rx_lo"], state="readonly",
+                          width=33, values=list(RX_LO_TYPES.values()))
+    lo_box.grid(row=0, column=1, columnspan=2, sticky="w", padx=(6, 0))
+    chain_rows[lo_f] = 1
+    lo_entries = osc_input(lo_f, "lo_pn", OSC_PRESETS, CHAIN_DEFAULT["lo_pn"],
+                           label="RX LO L(f)")
+
+    def chain_spec():
+        def num(key, label, lo=None):
+            raw = cv[key].get().strip().replace(",", ".")
+            try:
+                v = float(raw)
+            except ValueError:
+                raise ValueError(f"Transmitter - {label}: not a valid "
+                                 "number.") from None
+            if not math.isfinite(v) or (lo is not None and v < lo):
+                raise ValueError(f"Transmitter - {label}: must be "
+                                 f">= {lo:g}." if lo is not None else
+                                 f"Transmitter - {label}: invalid.")
+            return v
+
+        def pn(key, label):
+            text = cv[key].get().strip()
+            OscPN.parse(text, label)           # validate (raises ValueError)
+            return text
+
+        mag = type_names[cv["type"].get()] == "magnetron"
+        mode = cv["coho_mode"].get()
+        indep = lo_names[cv["rx_lo"].get()] == "independent"
+        spec = {
+            "type": type_names[cv["type"].get()],
+            "src_pn": pn("src_pn", "STALO" if mag else "Source"),
+            "amp": cv["amp"].get(),
+            "amp_push": num("amp_push", "phase pushing", 0),
+            "amp_supply": num("amp_supply", "supply jitter", 0),
+            "amp_add": num("amp_add", "additive jitter", 0),
+            "rx_lo": lo_names[cv["rx_lo"].get()],
+            "lo_pn": (pn("lo_pn", "RX LO") if indep and not mag
+                      else CHAIN_DEFAULT["lo_pn"]),
+            "mag_fjit_khz": num("mag_fjit_khz", "magnetron P2P jitter", 0),
+            "mag_chirp_khz": num("mag_chirp_khz",
+                                 "magnetron intrapulse change", 0),
+            "coho_mode": mode,
+            "coho": mode != "none",
+            "lock_point": lock_names[cv["lock_point"].get()],
+            "mag_lock": num("mag_lock", "lock residual", 0),
+            "coho_pn": (pn("coho_pn", "COHO") if mag and mode == "analog"
+                        else CHAIN_DEFAULT["coho_pn"]),
+            "dig_corr": corr_names[cv["dig_corr"].get()],
+            "dig_err": num("dig_err", "digital COHO measurement error", 0),
+            "dig_memory": bool(cv["dig_memory"].get()),
+        }
+        return spec
+
+    def on_chain_layout(*_):
+        mag = type_names[cv["type"].get()] == "magnetron"
+        src_f.config(text="STALO" if mag else "Source oscillator (exciter)")
+        if mag:
+            amp_f.grid_remove()
+            lo_f.grid_remove()
+            mag_f.grid()
+            coho_f.grid()
+        else:
+            mag_f.grid_remove()
+            coho_f.grid_remove()
+            amp_f.grid()
+            lo_f.grid()
+        mode = cv["coho_mode"].get()
+        for frame, key in ((ana_f, "analog"), (dig_f, "digital"),
+                           (none_lbl, "none")):
+            if mode == key:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        indep = lo_names[cv["rx_lo"].get()] == "independent"
+        for e in lo_entries:
+            e.state(["!disabled"] if indep else ["disabled"])
+        no_amp = cv["amp"].get() == "None (source direct)"
+        for e in amp_entries:
+            e.state(["disabled"] if no_amp else ["!disabled"])
+        schedule()
+
+    def on_amp_type(*_):
+        push, supply, add = AMP_TYPES[cv["amp"].get()]
+        for key, v in (("amp_push", push), ("amp_supply", supply),
+                       ("amp_add", add)):
+            cv[key].set(f"{v:g}")
+        on_chain_layout()
+
+    type_box.bind("<<ComboboxSelected>>", on_chain_layout)
+    lo_box.bind("<<ComboboxSelected>>", on_chain_layout)
+    amp_box.bind("<<ComboboxSelected>>", on_amp_type)
+    for b in coho_btns:
+        b.config(command=on_chain_layout)
+    mag_f.grid_remove()
+    coho_f.grid_remove()
+
+    chv = {"fig": None, "canvas": None, "res": None}
+
+    def redraw_chain(*_):
+        if chv["fig"] is None or chv["res"] is None or not tab_is(chain_tab):
+            return
+        try:
+            draw_chain(chv["fig"], chv["res"])
+        except (ValueError, ZeroDivisionError) as exc:
+            chv["fig"].clear()
+            chv["fig"].text(0.05, 0.9, f"Signal chain view not available: "
+                            f"{exc}", va="top", fontsize=10)
+        chv["canvas"].draw_idle()
+
+    if HAVE_PLOT:
+        chv["fig"] = Figure(figsize=(9, 10), dpi=100)
+        chv["canvas"] = FigureCanvasTkAgg(chv["fig"], master=chain_tab)
+        chv["canvas"].get_tk_widget().grid(row=1, column=0, sticky="nsew")
+        ch_bar = ttk.Frame(chain_tab)
+        ch_bar.grid(row=2, column=0, sticky="ew")
+        NavigationToolbar2Tk(chv["canvas"], ch_bar)
+    else:
+        ttk.Label(chain_tab, text="Install numpy and matplotlib for the "
+                  "signal chain view.").grid(row=1, column=0, sticky="nw")
+
     def on_tab_changed(_event=None):
         redraw_mf()
         redraw_geo()
+        redraw_chain()
         if tab_is(max_tab) and sw["rows"] is None:
             run_max_range(quiet=True)       # first visit: show a sweep
 
@@ -3365,6 +4789,7 @@ def build_gui():
             "mop": mop,
             "mop_param": None if mop == "None" else parse("mop_param"),
             "bw": parse("bw"), "freq": parse("freq"),
+            "chain": chain_spec(),
             "snr": parse("snr"), "temp": parse("temp"), "cpi": None if count else parse("cpi"),
             "n_pulses": parse_int("npulse") if count else None,
             "pol": POL_CODE[pol_var.get()],
@@ -3399,8 +4824,10 @@ def build_gui():
         show(format_result(res, table_dir), res["status_kind"])
         mf["res"] = res
         geo["res"] = res
+        chv["res"] = res
         redraw_mf()
         redraw_geo()
+        redraw_chain()
         summary = target_summary(res, short=True)
         for key, tkey, _l in measure_keys:
             set_quiet(key, summary[tkey])
@@ -3443,9 +4870,12 @@ def build_gui():
     vars_["mop_param"].trace_add("write", update_suggested)
     for var in vars_.values():
         var.trace_add("write", schedule)
+    for var in cv.values():
+        var.trace_add("write", schedule)
     root.bind("<Return>", lambda _e: calculate())
 
     on_mop_change()
+    on_chain_layout()
     on_cpi_mode_change()
     on_pw_mode_change()
     apply_table_availability(first_time=True)
